@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 router = Router(name="user")
 
 TASKS_PER_PAGE = 8
-API_TIMEOUT = 15.0  # Увеличен таймаут для всех API
+API_TIMEOUT = 15.0
 
 
 # --------------------------------------------------------------------- helpers
@@ -142,21 +142,25 @@ async def _notify_referrer(bot: Bot, referrer_id: int, payout: dict[str, Any], t
             logger.debug("Не удалось уведомить реферера %s", referrer_id)
 
 
-# ------------------------------------------------------------------ Параллельная загрузка заданий (С ПАГИНАЦИЕЙ И БОЛЬШИМИ ЛИМИТАМИ)
-async def _fetch_tgrass(user_id: int, from_user: Any) -> list[dict]:
+# ------------------------------------------------------------------ Параллельная загрузка заданий
+async def _fetch_tgrass(user_id: int, from_user: Any, db: Any) -> list[dict]:
     try:
         res = await tgrass_client.get_offers(
             user_id=user_id,
             lang=from_user.language_code or "ru",
             is_premium=from_user.is_premium or False,
             username=from_user.username,
-            limit=50,  # Увеличен лимит
+            limit=50,
         )
+        # Получаем процент из настроек (по умолчанию 50%)
+        percent = await db.get_int_setting("tgrass_percent", 50) / 100.0
+
         result = []
         for o in res.get("offers", []):
             if o.get("subscribed"): continue
             price = float(o.get("price", 0))
-            reward = int(price * STARS_SCALE) or 1000
+            # Начисляем процент от цены
+            reward = int(price * STARS_SCALE * percent) or 1000
             result.append({
                 "source": "tgrass", "id": str(o.get("offer_id")), "url": o.get("link"),
                 "title": o.get("name") or ("Канал" if o["type"] == "channel" else "Бот"),
@@ -165,9 +169,6 @@ async def _fetch_tgrass(user_id: int, from_user: Any) -> list[dict]:
         return result
     except Exception as e:
         logger.error(f"Ошибка Tgrass: {e}")
-        # Отправляем уведомление админу об ошибке
-        admin_id = getattr(from_user, 'id', None)  # Упрощенно
-        # В реальном коде нужно брать ID админа из настроек, но здесь просто пример
         return []
 
 async def _fetch_botohub(user_id: int, db: Any) -> list[dict]:
@@ -190,22 +191,26 @@ async def _fetch_botohub(user_id: int, db: Any) -> list[dict]:
             if len(tasks) < limit:
                 break
             offset += limit
-            await asyncio.sleep(0.2)  # Небольшая пауза между запросами
+            await asyncio.sleep(0.2)
         return all_tasks
     except Exception as e:
         logger.error(f"Ошибка BotoHub: {e}")
         return []
 
-async def _fetch_flyer(user_id: int, from_user: Any) -> list[dict]:
+async def _fetch_flyer(user_id: int, from_user: Any, db: Any) -> list[dict]:
     try:
         res = await flyer_client.get_tasks(
-            user_id=user_id, language_code=from_user.language_code or "ru", limit=50  # Увеличен лимит
+            user_id=user_id, language_code=from_user.language_code or "ru", limit=50
         )
+        # Получаем процент из настроек (по умолчанию 50%)
+        percent = await db.get_int_setting("flyer_percent", 50) / 100.0
+
         result = []
         for task in res.get("result", []):
             if task.get("status") == "completed": continue
             price = int(task.get("price", 0))
-            reward_units = price * STARS_SCALE if price > 0 else 1000
+            # Начисляем процент от цены
+            reward_units = int(price * STARS_SCALE * percent) if price > 0 else 1000
             result.append({
                 "source": "flyer", "id": str(task.get("signature")), "url": task.get("link"),
                 "title": task.get("name") or "Задание Flyer", "type": "channel", "reward": reward_units, "completed": False, "raw": task
@@ -216,10 +221,9 @@ async def _fetch_flyer(user_id: int, from_user: Any) -> list[dict]:
         return []
 
 async def _get_all_tasks(db: Any, user_id: int, from_user: Any) -> list[dict[str, Any]]:
-    """Собирает задания ОДНОВРЕМЕННО из всех источников."""
     tasks = []
 
-    # 1. Задания из БД (быстрые, без сети)
+    # 1. Задания из БД
     db_tasks, _ = await db.paginate_tasks(user_id, 1, 1000)
     for t in db_tasks:
         if t["is_completed"]: continue
@@ -228,16 +232,16 @@ async def _get_all_tasks(db: Any, user_id: int, from_user: Any) -> list[dict[str
             "type": t["type"], "reward": int(t["reward"]), "completed": False, "raw": t
         })
 
-    # 2. Внешние API (параллельно, с увеличенным таймаутом)
+    # 2. Внешние API
     try:
         results = await asyncio.wait_for(
             asyncio.gather(
-                _fetch_tgrass(user_id, from_user),
+                _fetch_tgrass(user_id, from_user, db), # Передали db
                 _fetch_botohub(user_id, db),
-                _fetch_flyer(user_id, from_user),
-                return_exceptions=True  # <-- Важно: не падать, если один из API упал
+                _fetch_flyer(user_id, from_user, db),  # Передали db
+                return_exceptions=True
             ),
-            timeout=API_TIMEOUT  # Увеличенный таймаут
+            timeout=API_TIMEOUT
         )
         for res in results:
             if isinstance(res, Exception):
@@ -251,7 +255,6 @@ async def _get_all_tasks(db: Any, user_id: int, from_user: Any) -> list[dict[str
 
 
 async def _show_tasks_page(message: Message, db: Any, user: dict[str, Any], from_user: Any, page: int = 1) -> None:
-    """Показывает объединенный список заданий."""
     all_tasks = await _get_all_tasks(db, int(user["id"]), from_user)
 
     if not all_tasks:
@@ -397,22 +400,17 @@ async def cb_bonus_roll(callback: CallbackQuery, db: Any, user: dict[str, Any], 
     if callback.message is None:
         return
 
-    # Отправляем кубик
     msg = await bot.send_dice(callback.message.chat.id, emoji="🎲")
     dice_value = msg.dice.value
 
-    # Начисляем
     reward_units = dice_value * STARS_SCALE
     await db.add_balance(int(user["id"]), reward_units, "daily_bonus", f"Кубик: выпало {dice_value}")
 
-    # Ждем, пока пройдет анимация кубика (около 2.5 секунд)
     await asyncio.sleep(2.5)
 
-    # Обновляем меню
     fresh = await db.get_user(int(user["id"])) or user
     await _show_daily_bonus(callback.message, db, fresh)
 
-    # Отправляем сообщение с результатом
     await bot.send_message(
         callback.message.chat.id,
         f"🎉 Тебе выпало <b>{dice_value}</b>! Начислено <b>{dice_value}</b> ⭐.\n"
@@ -461,7 +459,6 @@ async def cb_tasks_check(callback: CallbackQuery, db: Any, user: dict[str, Any])
 
     await safe_edit(callback.message, "⏳ <i>Проверяем выполнение заданий...</i>")
 
-    # Запускаем все проверки параллельно
     await asyncio.gather(
         _process_tgrass_payments(db, int(user["id"]), callback.from_user),
         _process_botohub_payments(db, int(user["id"])),
@@ -674,22 +671,24 @@ async def promo_code(message: Message, state: FSMContext, db: Any, settings: Any
     await message.answer(text, reply_markup=main_menu(is_admin(settings, int(fresh["id"]))))
 
 
-# ------------------------------------------------------------------- Начисления (С РЕФЕРАЛАМИ)
+# ------------------------------------------------------------------- Начисления (С РЕФЕРАЛАМИ И ПРОЦЕНТАМИ)
 async def _process_tgrass_payments(db: Any, user_id: int, from_user: Any) -> None:
     try:
         res = await tgrass_client.get_offers(
             user_id=user_id, lang=from_user.language_code or "ru",
             is_premium=from_user.is_premium or False, username=from_user.username,
-            limit=50  # И здесь тоже
+            limit=50
         )
         ref = await get_ref_settings(db)
+        percent = await db.get_int_setting("tgrass_percent", 50) / 100.0 # Берем процент
+
         for offer in res.get("offers", []):
             if not offer.get("subscribed"): continue
             offer_id = offer.get("offer_id")
             if offer_id is None: continue
 
             price = float(offer.get("price", 0.0))
-            reward_units = int(price * STARS_SCALE) or 1000
+            reward_units = int(price * STARS_SCALE * percent) or 1000 # Считаем с процентом
 
             success = await db.complete_tgrass_offer(user_id, int(offer_id), reward_units)
             if success:
@@ -703,7 +702,7 @@ async def _process_tgrass_payments(db: Any, user_id: int, from_user: Any) -> Non
 
 async def _process_botohub_payments(db: Any, user_id: int) -> None:
     try:
-        res = await botohub_client.get_tasks(user_id, limit=50)  # И здесь
+        res = await botohub_client.get_tasks(user_id, limit=50)
         reward_units = await db.get_int_setting("botohub_reward_units", 10000)
         ref = await get_ref_settings(db)
 
@@ -725,16 +724,18 @@ async def _process_botohub_payments(db: Any, user_id: int) -> None:
 async def _process_flyer_payments(db: Any, user_id: int, from_user: Any) -> None:
     try:
         res = await flyer_client.get_tasks(
-            user_id=user_id, language_code=from_user.language_code or "ru", limit=50  # И здесь
+            user_id=user_id, language_code=from_user.language_code or "ru", limit=50
         )
         ref = await get_ref_settings(db)
+        percent = await db.get_int_setting("flyer_percent", 50) / 100.0 # Берем процент
+
         for task in res.get("result", []):
             if task.get("status") != "completed": continue
             signature = task.get("signature")
             if not signature: continue
 
             price = int(task.get("price", 0))
-            reward_units = price * STARS_SCALE if price > 0 else 1000
+            reward_units = int(price * STARS_SCALE * percent) if price > 0 else 1000 # Считаем с процентом
 
             success = await db.complete_flyer_task(user_id, str(signature), reward_units)
             if success:

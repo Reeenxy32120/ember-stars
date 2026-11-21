@@ -121,8 +121,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "price_view_units": "345",
     "price_show_units": "860",
     "sponsor_channels": "",
-    "botohub_reward_units": "10000",  # 1 ⭐
+    "botohub_reward_units": "10000",  # 1 ⭐ (фиксированная награда)
     "partner_channel_url": "",
+    "tgrass_percent": "50", # <-- НОВОЕ: Процент от цены Tgrass
+    "flyer_percent": "50",  # <-- НОВОЕ: Процент от цены Flyer
 }
 
 SETTINGS_TITLES: dict[str, str] = {
@@ -136,6 +138,8 @@ SETTINGS_TITLES: dict[str, str] = {
     "price_show_units": "Цена показа",
     "sponsor_channels": "Спонсоры (обязательная подписка)",
     "botohub_reward_units": "Награда за задание BotoHub",
+    "tgrass_percent": "Процент награды Tgrass (%)", # <-- НОВОЕ
+    "flyer_percent": "Процент награды Flyer (%)",   # <-- НОВОЕ
 }
 
 STAR_UNIT_SETTINGS: frozenset[str] = frozenset(
