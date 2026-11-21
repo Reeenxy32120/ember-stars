@@ -85,9 +85,11 @@ def combined_tasks_menu(tasks: Sequence[dict], page: int, pages: int) -> InlineK
         else:
             rows.append([_url_button(label, task["url"])])
 
-    rows.append(pagination_row("tasks:page", page, pages))
+    if pages > 1:
+        rows.append(pagination_row("tasks:page", page, pages))
+
     rows.append([_button("✅ Проверить", "tasks:check")])
-    rows.append([_button("🔄 Обновить", f"tasks:page:{page}")])
+    rows.append([_button("🔄 Обновить", "tasks:refresh")]) # <-- ИСПРАВЛЕНО
     rows.append([_button("← Главная", "menu:main")])
     return _kb(rows)
 
@@ -153,7 +155,6 @@ def withdraw_gifts_menu(user_balance: int, friends_count: int) -> InlineKeyboard
         is_locked = user_balance < price_units
         lock_mark = " 🔒" if is_locked else ""
 
-        # Если не хватает друзей для первого вывода
         if friends_count < 3:
             lock_mark = " 🔒"
 
