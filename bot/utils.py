@@ -1,206 +1,401 @@
-"""Вспомогательные функции: форматирование Stars, HTML, шаблоны текстов."""
+"""Сервисный слой: тексты из БД, настройки, проверка заданий, награды."""
 
 from __future__ import annotations
 
-import html
+import logging
 import re
-from datetime import datetime
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
-from urllib.parse import quote, urlsplit
+from typing import Any
 
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import InlineKeyboardMarkup, Message
+import httpx
+from aiogram import Bot
+from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
-STARS_SCALE = 10_000
-MAX_STARS_INPUT = Decimal("1000000")
-PLACEHOLDER_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+from bot.config import load_settings
+from bot.database import Database
+from bot.defaults import DEFAULT_SETTINGS, DEFAULT_TEXTS, STAR_UNIT_SETTINGS, TASK_TYPE_LABELS
+from bot.utils import (
+    STARS_SCALE,
+    escape,
+    format_units,
+    normalize_chat_ref,
+    render,
+    split_sponsor_refs,
+    sponsor_display,
+    sponsor_url,
+)
 
-TRANSACTION_KIND_LABELS = {
-    "task": "✅ Задание",
-    "referral_bonus": "🎁 Бонус за друга",
-    "referral_percent": "👥 % от реферала",
-    "withdraw": "💸 Заявка на вывод",
-    "withdraw_refund": "↩️ Возврат заявки",
-    "promo": "🎟 Промокод",
-    "admin": "🛠 Начисление админа",
-    "order_refund": "↩️ Возврат за заказ",
-    "daily_bonus": "🎲 Ежедневный бонус",
+logger = logging.getLogger(__name__)
+
+SUBSCRIBED_STATUSES = {
+    ChatMemberStatus.CREATOR,
+    ChatMemberStatus.ADMINISTRATOR,
+    ChatMemberStatus.MEMBER,
 }
 
 
-class StarsParseError(ValueError):
-    """Пользователь ввёл некорректную сумму Stars."""
+# ------------------------------------------------------------------- TGRASS
+class TgrassClient:
+    """Клиент для работы с API Tgrass."""
 
+    def __init__(self, api_key: str, base_url: str = "https://tgrass.space") -> None:
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.headers = {
+            "accept": "application/json",
+            "Content-Type": "application/json",
+            "Auth": self.api_key,
+        }
 
-def parse_stars(raw: str, *, max_stars: Decimal = MAX_STARS_INPUT) -> int:
-    """Превращает пользовательский ввод («50», «50,5») во внутренние единицы.
+    async def get_offers(
+        self,
+        user_id: int,
+        lang: str,
+        is_premium: bool,
+        username: str | None = None,
+        limit: int = 50,  # <-- ДОБАВЛЕН ПАРАМЕТР LIMIT
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "tg_user_id": int(user_id),
+            "lang": (lang or "ru")[:8],
+            "is_premium": bool(is_premium),
+            "limit": int(limit),  # <-- ПЕРЕДАЕМ LIMIT
+        }
+        if username:
+            payload["tg_login"] = username.lstrip("@")
 
-    1 ⭐ = STARS_SCALE внутренних единиц. Точность — до 4 знаков после запятой.
-    """
-    text = (raw or "").strip().replace(",", ".").replace("⭐", "").replace(" ", "")
-    if not text:
-        raise StarsParseError("Введи число, например 50")
-    if not re.fullmatch(r"\d+(?:\.\d+)?", text):
-        raise StarsParseError("Нужно положительное число, например 50")
-    try:
-        value = Decimal(text)
-    except InvalidOperation as exc:  # pragma: no cover - защита от экзотики
-        raise StarsParseError("Не удалось распознать число") from exc
-    if value <= 0:
-        raise StarsParseError("Сумма должна быть больше нуля")
-    if value > max_stars:
-        raise StarsParseError(f"Слишком большая сумма (максимум {max_stars} ⭐)")
-    units = int((value * STARS_SCALE).to_integral_value(rounding=ROUND_HALF_UP))
-    if units <= 0:
-        raise StarsParseError("Слишком маленькая сумма")
-    return units
-
-
-def format_units(units: int) -> str:
-    """Форматирует внутренние единицы как сумму Stars без лишних нулей."""
-    value = Decimal(int(units)) / STARS_SCALE
-    text = format(value, "f")
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return text or "0"
-
-
-def telegram_stars_amount(units: int) -> int:
-    """Сколько целых Stars списать при оплате (минимум 1)."""
-    return max(1, -(-int(units) // STARS_SCALE))
-
-
-def escape(value: object) -> str:
-    """Экранирует пользовательский текст для parse_mode=HTML."""
-    return html.escape(str(value), quote=False)
-
-
-def render(template: str, **values: object) -> str:
-    """Подставляет {ключи} в шаблон, не трогая незнакомые плейсхолдеры."""
-
-    def replace(match: re.Match[str]) -> str:
-        key = match.group(1)
-        if key in values:
-            return str(values[key])
-        return match.group(0)
-
-    return PLACEHOLDER_RE.sub(replace, template or "")
-
-
-def format_dt(raw: str | None) -> str:
-    """«2024-05-01 10:20:30» (UTC из SQLite) → «01.05.2024 10:20»."""
-    if not raw:
-        return "—"
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
         try:
-            return datetime.strptime(raw, fmt).strftime("%d.%m.%Y %H:%M")
+            async with httpx.AsyncClient(timeout=20.0) as client:  # <-- УВЕЛИЧЕН ТАЙМАУТ
+                response = await client.post(
+                    f"{self.base_url}/offers",
+                    json=payload,
+                    headers=self.headers,
+                )
+                response.raise_for_status()
+                data = response.json()
+                logger.info("Tgrass API /offers ответ: %s", data)
+                return data
+        except httpx.HTTPError as exc:
+            logger.error("Tgrass API /offers ошибка: %s", exc)
+            raise
+
+    async def check_offer(self, user_id: int, offer_id: int) -> dict[str, Any]:
+        payload = {
+            "tg_user_id": int(user_id),
+            "offer_id": int(offer_id),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/check",
+                    json=payload,
+                    headers=self.headers,
+                )
+                response.raise_for_status()
+                return response.json()
+        except httpx.HTTPError as exc:
+            logger.error("Tgrass API /check ошибка: %s", exc)
+            raise
+
+# ------------------------------------------------------------------- BOTOHUB
+class BotohubClient:
+    """Клиент для работы с API BotoHub."""
+
+    def __init__(self, token: str) -> None:
+        self.token = token
+        self.base_url = "https://botohub.me"
+        self.headers = {
+            "Auth": self.token,
+            "Content-Type": "application/json",
+        }
+
+    async def get_tasks(self, chat_id: int, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        payload = {
+            "chat_id": int(chat_id),
+            "limit": int(limit),   # <-- ДОБАВЛЕН LIMIT
+            "offset": int(offset), # <-- ДОБАВЛЕН OFFSET
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:  # <-- УВЕЛИЧЕН ТАЙМАУТ
+                response = await client.post(
+                    f"{self.base_url}/get-tasks-extended",
+                    json=payload,
+                    headers=self.headers,
+                )
+                response.raise_for_status()
+                data = response.json()
+                logger.info("BotoHub API /get-tasks-extended ответ: %s", data)
+                return data
+        except httpx.HTTPError as exc:
+            logger.error("BotoHub API ошибка: %s", exc)
+            raise
+
+# ------------------------------------------------------------------- FLYER
+class FlyerClient:
+    """Клиент для работы с API Flyer."""
+
+    def __init__(self, api_key: str, base_url: str = "https://api.flyerservice.io") -> None:
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+
+    async def get_tasks(self, user_id: int, language_code: str = "ru", limit: int = 50) -> dict[str, Any]:
+        payload = {
+            "key": self.api_key,
+            "user_id": int(user_id),
+            "language_code": language_code,
+            "limit": limit,  # <-- УВЕЛИЧЕН ЛИМИТ (было 10)
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:  # <-- УВЕЛИЧЕН ТАЙМАУТ
+                response = await client.post(
+                    f"{self.base_url}/get_tasks",
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+                logger.info("Flyer API /get_tasks ответ: %s", data)
+                return data
+        except httpx.HTTPError as exc:
+            logger.error("Flyer API /get_tasks ошибка: %s", exc)
+            raise
+
+    async def check_task(self, signature: str) -> dict[str, Any]:
+        payload = {
+            "key": self.api_key,
+            "signature": signature,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/check_task",
+                    json=payload,
+                )
+                response.raise_for_status()
+                return response.json()
+        except httpx.HTTPError as exc:
+            logger.error("Flyer API /check_task ошибка: %s", exc)
+            raise
+
+
+_settings = load_settings()
+tgrass_client = TgrassClient(
+    api_key=_settings.tgrass_api_key,
+    base_url=_settings.tgrass_api_url,
+)
+botohub_client = BotohubClient(_settings.botohub_api_token)
+flyer_client = FlyerClient(_settings.flyer_api_key)
+
+
+# --------------------------------------------------------------------- тексты
+async def get_text(db: Database, key: str) -> str:
+    """Текст раздела: значение из настроек админки или дефолт."""
+    value = await db.get_setting(f"text:{key}")
+    if value is None:
+        return DEFAULT_TEXTS.get(key, "")
+    return value
+
+
+async def get_texts(db: Database) -> dict[str, str]:
+    """Все редактируемые тексты (дефолты + переопределения)."""
+    stored = await db.get_all_settings()
+    return {
+        key: stored.get(f"text:{key}", default)
+        for key, default in DEFAULT_TEXTS.items()
+    }
+
+
+async def set_text(db: Database, key: str, value: str) -> None:
+    await db.set_setting(f"text:{key}", value)
+
+
+async def reset_text(db: Database, key: str) -> None:
+    await db.set_setting(f"text:{key}", DEFAULT_TEXTS.get(key, ""))
+
+
+# ------------------------------------------------------------------- настройки
+def default_units(key: str) -> int:
+    return int(DEFAULT_SETTINGS.get(key, "0"))
+
+
+async def get_units_setting(db: Database, key: str) -> int:
+    """Настройка, хранящаяся в единицах Stars (1 ⭐ = 10 000)."""
+    return await db.get_int_setting(key, default_units(key))
+
+
+async def get_min_withdraw_units(db: Database) -> int:
+    return await get_units_setting(db, "min_withdraw_units")
+
+
+async def get_ref_settings(db: Database) -> dict[str, int]:
+    return {
+        "bonus_units": await get_units_setting(db, "ref_bonus_units"),
+        "required_tasks": await db.get_int_setting(
+            "ref_tasks_required", int(DEFAULT_SETTINGS["ref_tasks_required"])
+        ),
+        "percent": await db.get_int_setting(
+            "ref_percent", int(DEFAULT_SETTINGS["ref_percent"])
+        ),
+    }
+
+
+async def get_prices(db: Database) -> dict[str, int]:
+    return {
+        "task": await get_units_setting(db, "price_task_units"),
+        "broadcast": await get_units_setting(db, "price_broadcast_units"),
+        "view": await get_units_setting(db, "price_view_units"),
+        "show": await get_units_setting(db, "price_show_units"),
+    }
+
+
+async def get_settings_view(db: Database) -> dict[str, str]:
+    """Все настройки с подставленными дефолтами."""
+    stored = await db.get_all_settings()
+    return {key: stored.get(key, default) for key, default in DEFAULT_SETTINGS.items()}
+
+
+def setting_display(key: str, raw: str | int) -> str:
+    """Человекочитаемое значение настройки для админки."""
+    if key == "sponsor_channels":
+        refs = split_sponsor_refs(str(raw or ""))
+        return ", ".join(sponsor_display(ref) for ref in refs) or "—"
+    if key in STAR_UNIT_SETTINGS:
+        try:
+            return f"{format_units(int(raw))} ⭐"
+        except (TypeError, ValueError):
+            return str(raw)
+    return str(raw)
+
+
+def setting_from_input(key: str, raw: str) -> str:
+    """Проверяет ввод админа и возвращает значение для записи в БД."""
+    from bot.utils import StarsParseError, parse_stars
+
+    value = (raw or "").strip()
+    if not value:
+        raise ValueError("Пустое значение")
+    if key == "sponsor_channels":
+        if value.lower() in {"-", "—", "none", "off", "0", "нет"}:
+            return ""
+        refs = split_sponsor_refs(value)
+        if not refs:
+            raise ValueError(
+                "Укажи публичный канал: @username или https://t.me/username"
+            )
+        return ",".join(refs)
+    if key in STAR_UNIT_SETTINGS:
+        try:
+            units = parse_stars(value)
+        except StarsParseError as exc:
+            raise ValueError(str(exc)) from exc
+        return str(units)
+    if not re.fullmatch(r"\d+", value):
+        raise ValueError("Нужно целое положительное число")
+    number = int(value)
+    if number <= 0:
+        raise ValueError("Значение должно быть больше нуля")
+    if key == "ref_percent" and number > 100:
+        raise ValueError("Процент не может быть больше 100")
+    return str(number)
+
+
+# ------------------------------------------------------------------- спонсоры
+async def get_sponsor_channels(db: Database) -> list[str]:
+    """Список каналов обязательной подписки (@username)."""
+    raw = await db.get_setting("sponsor_channels", "")
+    return split_sponsor_refs(raw or "")
+
+
+async def evaluate_sponsors(
+    bot: Bot, db: Database, user_id: int
+) -> tuple[list[str], list[str]]:
+    """Возвращает (каналы без подписки, каналы без возможности проверки)."""
+    sponsors = await get_sponsor_channels(db)
+    missing: list[str] = []
+    unverifiable: list[str] = []
+    for ref in sponsors:
+        try:
+            member = await bot.get_chat_member(chat_id=ref, user_id=user_id)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            unverifiable.append(ref)
+            continue
+        try:
+            status = ChatMemberStatus(str(member.status))
         except ValueError:
+            unverifiable.append(ref)
             continue
-    return raw
-
-
-def truncate(text: str, limit: int = 60) -> str:
-    text = (text or "").strip()
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
-
-
-def build_ref_link(bot_username: str, user_id: int) -> str:
-    username = (bot_username or "").lstrip("@")
-    return f"https://t.me/{username}?start=ref_{user_id}"
-
-
-def build_share_url(ref_link: str, text: str) -> str:
-    return f"https://t.me/share/url?url={quote(ref_link, safe='')}&text={quote(text, safe='')}"
-
-
-def normalize_username(username: str | None) -> str | None:
-    if not username:
-        return None
-    value = username.strip().lstrip("@")
-    return value or None
-
-
-SPONSOR_SPLIT_RE = re.compile(r"[,;\s]+")
-
-
-def normalize_chat_ref(chat_id: str | int | None) -> str | None:
-    """Приводит ссылку вида https://t.me/channel к виду @channel."""
-    if chat_id is None:
-        return None
-    value = str(chat_id).strip()
-    if value.startswith("@"):
-        return value
-    if value.startswith("t.me/"):
-        value = "https://" + value
-    if value.startswith(("http://", "https://")):
-        parsed = urlsplit(value)
-        if parsed.netloc.lower() not in {"t.me", "telegram.me", "telegram.dog"}:
-            return value
-        path = parsed.path.strip("/")
-        if not path:
-            return None
-        username = path.split("/")[0]
-        return f"@{username}" if username else None
-    return value or None
-
-
-def split_sponsor_refs(raw: str) -> list[str]:
-    """Разбирает список каналов-спонсоров в канонические @username."""
-    refs: list[str] = []
-    seen: set[str] = set()
-    for chunk in SPONSOR_SPLIT_RE.split(raw or ""):
-        ref = normalize_chat_ref(chunk)
-        if not ref or not (ref.startswith("@") or ref.startswith(("http://", "https://"))):
+        if status in SUBSCRIBED_STATUSES:
             continue
-        key = ref.lower()
-        if key in seen:
+        if status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False):
             continue
-        seen.add(key)
-        refs.append(ref)
-    return refs
+        missing.append(ref)
+    return missing, unverifiable
 
 
-def sponsor_url(ref: str) -> str:
-    """Ссылка для кнопки «Подписаться»."""
-    if ref.startswith("@"):
-        return f"https://t.me/{ref[1:]}"
-    if ref.startswith("t.me/"):
-        return "https://" + ref
-    return ref
+async def get_sponsor_gate_text(db: Database) -> str:
+    """Готовый текст экрана обязательной подписки."""
+    template = await get_text(db, "sponsor_gate")
+    sponsors = await get_sponsor_channels(db)
+    links = "\n".join(
+        f'• <a href="{escape(sponsor_url(ref))}">{escape(sponsor_display(ref))}</a>'
+        for ref in sponsors
+    )
+    return render(template, sponsors=links)
 
 
-def sponsor_display(ref: str) -> str:
-    """Подпись канала в тексте экрана подписки."""
-    if ref.startswith("@"):
-        return ref
-    normalized = normalize_chat_ref(ref)
-    if normalized and normalized.startswith("@"):
-        return normalized
-    return ref
-
-
-async def safe_edit(
-    message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None
-) -> None:
-    """Редактирует сообщение; при неудаче отправляет новое, игнорируя «not modified»."""
+# ------------------------------------------------------------------- задания
+async def check_subscription(
+    bot: Bot, chat_id: str | int | None, user_id: int
+) -> bool:
+    """Проверяет подписку через getChatMember. Ошибки API → False."""
+    chat_ref = normalize_chat_ref(chat_id)
+    if not chat_ref:
+        return False
     try:
-        await message.edit_text(text, reply_markup=reply_markup)
-    except TelegramBadRequest as exc:
-        if "message is not modified" in str(exc):
-            return
-        try:
-            await message.answer(text, reply_markup=reply_markup)
-        except TelegramBadRequest:
-            pass
+        member = await bot.get_chat_member(chat_id=chat_ref, user_id=user_id)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return False
+    try:
+        status = ChatMemberStatus(str(member.status))
+    except ValueError:
+        return False
+    if status in SUBSCRIBED_STATUSES:
+        return True
+    if status == ChatMemberStatus.RESTRICTED:
+        return bool(getattr(member, "is_member", False))
+    return False
 
 
-def plural(n: int, one: str, few: str, many: str) -> str:
-    n = abs(int(n)) % 100
-    if 11 <= n <= 19:
-        return many
-    n %= 10
-    if n == 1:
-        return one
-    if 2 <= n <= 4:
-        return few
-    return many
+async def verify_task(bot: Bot, user_id: int, task: dict[str, Any]) -> bool:
+    """Проверяет условия задания."""
+    task_type = str(task.get("type") or "channel")
+    chat_id = task.get("chat_id")
+    if task_type == "channel":
+        return await check_subscription(bot, chat_id or task.get("url"), user_id)
+    if task_type == "bot" and chat_id:
+        return await check_subscription(bot, chat_id, user_id)
+    return True
+
+
+def task_type_label(task: dict[str, Any]) -> str:
+    return TASK_TYPE_LABELS.get(str(task.get("type")), str(task.get("type")))
+
+
+async def claim_task_reward(db: Database, user_id: int, task: dict[str, Any]) -> dict[str, Any]:
+    """Начисляет награду и реферальные бонусы. ``completed=False`` — уже было."""
+    reward = int(task["reward"])
+    completed = await db.complete_task(user_id, int(task["id"]), reward)
+    if not completed:
+        return {"completed": False, "reward": reward, "payout": None}
+    ref = await get_ref_settings(db)
+    payout = await db.apply_referral_rewards(
+        user_id,
+        reward,
+        required_tasks=ref["required_tasks"],
+        bonus=ref["bonus_units"],
+        percent=ref["percent"],
+    )
+    return {"completed": True, "reward": reward, "payout": payout}
+
+
+def units_to_stars(value: int) -> float:
+    return int(value) / STARS_SCALE

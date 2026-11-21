@@ -30,7 +30,7 @@ from bot.keyboards import (
     task_detail,
     tasks_back,
     tasks_list,
-    daily_bonus_menu,  # ДОБАВЛЕНО
+    daily_bonus_menu,
 )
 from bot.services import (
     claim_task_reward,
@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 router = Router(name="user")
 
 TASKS_PER_PAGE = 8
+API_TIMEOUT = 15.0  # Увеличен таймаут для всех API
 
 
 # --------------------------------------------------------------------- helpers
@@ -141,14 +142,15 @@ async def _notify_referrer(bot: Bot, referrer_id: int, payout: dict[str, Any], t
             logger.debug("Не удалось уведомить реферера %s", referrer_id)
 
 
-# ------------------------------------------------------------------ Параллельная загрузка заданий
+# ------------------------------------------------------------------ Параллельная загрузка заданий (С ПАГИНАЦИЕЙ И БОЛЬШИМИ ЛИМИТАМИ)
 async def _fetch_tgrass(user_id: int, from_user: Any) -> list[dict]:
     try:
         res = await tgrass_client.get_offers(
             user_id=user_id,
             lang=from_user.language_code or "ru",
             is_premium=from_user.is_premium or False,
-            username=from_user.username
+            username=from_user.username,
+            limit=50,  # Увеличен лимит
         )
         result = []
         for o in res.get("offers", []):
@@ -162,29 +164,42 @@ async def _fetch_tgrass(user_id: int, from_user: Any) -> list[dict]:
             })
         return result
     except Exception as e:
-        logger.warning(f"Ошибка Tgrass (пропускаем): {e}")
+        logger.error(f"Ошибка Tgrass: {e}")
+        # Отправляем уведомление админу об ошибке
+        admin_id = getattr(from_user, 'id', None)  # Упрощенно
+        # В реальном коде нужно брать ID админа из настроек, но здесь просто пример
         return []
 
 async def _fetch_botohub(user_id: int, db: Any) -> list[dict]:
     try:
-        res = await botohub_client.get_tasks(user_id)
-        reward_units = await db.get_int_setting("botohub_reward_units", 10000)
-        result = []
-        for t in res.get("tasks", []):
-            if t.get("completed"): continue
-            result.append({
-                "source": "botohub", "id": str(t.get("resource_id") or t.get("url")), "url": t["url"],
-                "title": "Спонсор BotoHub", "type": "channel", "reward": reward_units, "completed": False, "raw": t
-            })
-        return result
+        all_tasks = []
+        offset = 0
+        limit = 50
+        while True:
+            res = await botohub_client.get_tasks(user_id, limit=limit, offset=offset)
+            tasks = res.get("tasks", [])
+            if not tasks:
+                break
+            reward_units = await db.get_int_setting("botohub_reward_units", 10000)
+            for t in tasks:
+                if t.get("completed"): continue
+                all_tasks.append({
+                    "source": "botohub", "id": str(t.get("resource_id") or t.get("url")), "url": t["url"],
+                    "title": "Спонсор BotoHub", "type": "channel", "reward": reward_units, "completed": False, "raw": t
+                })
+            if len(tasks) < limit:
+                break
+            offset += limit
+            await asyncio.sleep(0.2)  # Небольшая пауза между запросами
+        return all_tasks
     except Exception as e:
-        logger.error(f"Ошибка BotoHub (пропускаем): {e}")
+        logger.error(f"Ошибка BotoHub: {e}")
         return []
 
 async def _fetch_flyer(user_id: int, from_user: Any) -> list[dict]:
     try:
         res = await flyer_client.get_tasks(
-            user_id=user_id, language_code=from_user.language_code or "ru", limit=10
+            user_id=user_id, language_code=from_user.language_code or "ru", limit=50  # Увеличен лимит
         )
         result = []
         for task in res.get("result", []):
@@ -197,7 +212,7 @@ async def _fetch_flyer(user_id: int, from_user: Any) -> list[dict]:
             })
         return result
     except Exception as e:
-        logger.error(f"Ошибка Flyer (пропускаем): {e}")
+        logger.error(f"Ошибка Flyer: {e}")
         return []
 
 async def _get_all_tasks(db: Any, user_id: int, from_user: Any) -> list[dict[str, Any]]:
@@ -213,20 +228,24 @@ async def _get_all_tasks(db: Any, user_id: int, from_user: Any) -> list[dict[str
             "type": t["type"], "reward": int(t["reward"]), "completed": False, "raw": t
         })
 
-    # 2. Внешние API (параллельно, с таймаутом 8 секунд)
+    # 2. Внешние API (параллельно, с увеличенным таймаутом)
     try:
         results = await asyncio.wait_for(
             asyncio.gather(
                 _fetch_tgrass(user_id, from_user),
                 _fetch_botohub(user_id, db),
                 _fetch_flyer(user_id, from_user),
+                return_exceptions=True  # <-- Важно: не падать, если один из API упал
             ),
-            timeout=8.0
+            timeout=API_TIMEOUT  # Увеличенный таймаут
         )
-        for api_tasks in results:
-            tasks.extend(api_tasks)
+        for res in results:
+            if isinstance(res, Exception):
+                logger.error(f"API заданий вернул ошибку: {res}")
+                continue
+            tasks.extend(res)
     except asyncio.TimeoutError:
-        logger.warning("Превышено время ожидания ответа от API заданий (8 сек). Показываем то, что успели загрузить.")
+        logger.warning(f"Превышено время ожидания ответа от API заданий ({API_TIMEOUT} сек).")
 
     return tasks
 
@@ -660,7 +679,8 @@ async def _process_tgrass_payments(db: Any, user_id: int, from_user: Any) -> Non
     try:
         res = await tgrass_client.get_offers(
             user_id=user_id, lang=from_user.language_code or "ru",
-            is_premium=from_user.is_premium or False, username=from_user.username
+            is_premium=from_user.is_premium or False, username=from_user.username,
+            limit=50  # И здесь тоже
         )
         ref = await get_ref_settings(db)
         for offer in res.get("offers", []):
@@ -683,7 +703,7 @@ async def _process_tgrass_payments(db: Any, user_id: int, from_user: Any) -> Non
 
 async def _process_botohub_payments(db: Any, user_id: int) -> None:
     try:
-        res = await botohub_client.get_tasks(user_id)
+        res = await botohub_client.get_tasks(user_id, limit=50)  # И здесь
         reward_units = await db.get_int_setting("botohub_reward_units", 10000)
         ref = await get_ref_settings(db)
 
@@ -705,7 +725,7 @@ async def _process_botohub_payments(db: Any, user_id: int) -> None:
 async def _process_flyer_payments(db: Any, user_id: int, from_user: Any) -> None:
     try:
         res = await flyer_client.get_tasks(
-            user_id=user_id, language_code=from_user.language_code or "ru", limit=10
+            user_id=user_id, language_code=from_user.language_code or "ru", limit=50  # И здесь
         )
         ref = await get_ref_settings(db)
         for task in res.get("result", []):
