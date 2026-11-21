@@ -142,88 +142,78 @@ async def _notify_referrer(bot: Bot, referrer_id: int, payout: dict[str, Any], t
             logger.debug("Не удалось уведомить реферера %s", referrer_id)
 
 
-# ------------------------------------------------------------------ Параллельная загрузка заданий
-async def _fetch_tgrass(user_id: int, from_user: Any, db: Any) -> list[dict]:
-    try:
-        res = await tgrass_client.get_offers(
-            user_id=user_id,
-            lang=from_user.language_code or "ru",
-            is_premium=from_user.is_premium or False,
-            username=from_user.username,
-            limit=50,
-        )
-        # Получаем процент из настроек (по умолчанию 50%)
-        percent = await db.get_int_setting("tgrass_percent", 50) / 100.0
+# ------------------------------------------------------------------ Загрузка заданий
+async def _fetch_tgrass(user_id: int, from_user: Any, db: Any) -> tuple[list[dict], Any, str]:
+    # Убрали limit, чтобы не было ошибки
+    res = await tgrass_client.get_offers(
+        user_id=user_id,
+        lang=from_user.language_code or "ru",
+        is_premium=from_user.is_premium or False,
+        username=from_user.username,
+    )
+    reward_units = await db.get_int_setting("tgrass_reward_units", 20000)
 
-        result = []
-        for o in res.get("offers", []):
-            if o.get("subscribed"): continue
-            price = float(o.get("price", 0))
-            # Начисляем процент от цены
-            reward = int(price * STARS_SCALE * percent) or 1000
-            result.append({
-                "source": "tgrass", "id": str(o.get("offer_id")), "url": o.get("link"),
-                "title": o.get("name") or ("Канал" if o["type"] == "channel" else "Бот"),
-                "type": o.get("type", "channel"), "reward": reward, "completed": False, "raw": o
+    result = []
+    for o in res.get("offers", []):
+        if o.get("subscribed"): continue
+        result.append({
+            "source": "tgrass", "id": str(o.get("offer_id")), "url": o.get("link"),
+            "title": o.get("name") or ("Канал" if o["type"] == "channel" else "Бот"),
+            "type": o.get("type", "channel"), "reward": reward_units, "completed": False, "raw": o
+        })
+    return result, res, "Tgrass"
+
+async def _fetch_botohub(user_id: int, db: Any) -> tuple[list[dict], Any, str]:
+    all_tasks = []
+    offset = 0
+    limit = 50
+    last_res = {}
+    while True:
+        res = await botohub_client.get_tasks(user_id, limit=limit, offset=offset)
+        last_res = res
+        tasks = res.get("tasks", [])
+        if not tasks:
+            break
+        reward_units = await db.get_int_setting("botohub_reward_units", 10000)
+        for t in tasks:
+            if t.get("completed"): continue
+            all_tasks.append({
+                "source": "botohub", "id": str(t.get("resource_id") or t.get("url")), "url": t["url"],
+                "title": "Спонсор BotoHub", "type": "channel", "reward": reward_units, "completed": False, "raw": t
             })
-        return result
-    except Exception as e:
-        logger.error(f"Ошибка Tgrass: {e}")
-        return []
+        if len(tasks) < limit:
+            break
+        offset += limit
+        await asyncio.sleep(0.2)
+    return all_tasks, last_res, "BotoHub"
 
-async def _fetch_botohub(user_id: int, db: Any) -> list[dict]:
-    try:
-        all_tasks = []
-        offset = 0
-        limit = 50
-        while True:
-            res = await botohub_client.get_tasks(user_id, limit=limit, offset=offset)
-            tasks = res.get("tasks", [])
-            if not tasks:
-                break
-            reward_units = await db.get_int_setting("botohub_reward_units", 10000)
-            for t in tasks:
-                if t.get("completed"): continue
-                all_tasks.append({
-                    "source": "botohub", "id": str(t.get("resource_id") or t.get("url")), "url": t["url"],
-                    "title": "Спонсор BotoHub", "type": "channel", "reward": reward_units, "completed": False, "raw": t
-                })
-            if len(tasks) < limit:
-                break
-            offset += limit
-            await asyncio.sleep(0.2)
-        return all_tasks
-    except Exception as e:
-        logger.error(f"Ошибка BotoHub: {e}")
-        return []
+async def _fetch_flyer(user_id: int, from_user: Any, db: Any) -> tuple[list[dict], Any, str]:
+    # Временно отключен, так как домен api.flyerservice.io не отвечает (DNS error)
+    return [], {"error": "Flyer API domain is dead"}, "Flyer"
 
-async def _fetch_flyer(user_id: int, from_user: Any, db: Any) -> list[dict]:
-    try:
-        res = await flyer_client.get_tasks(
-            user_id=user_id, language_code=from_user.language_code or "ru", limit=50
-        )
-        # Получаем процент из настроек (по умолчанию 50%)
-        percent = await db.get_int_setting("flyer_percent", 50) / 100.0
+    # Если сервис оживет, просто раскомментируй код ниже, а строку return выше удали:
+    """
+    res = await flyer_client.get_tasks(
+        user_id=user_id, language_code=from_user.language_code or "ru", limit=50
+    )
+    reward_units = await db.get_int_setting("flyer_reward_units", 20000)
+    result = []
+    for task in res.get("result", []):
+        if task.get("status") == "completed": continue
+        result.append({
+            "source": "flyer", "id": str(task.get("signature")), "url": task.get("link"),
+            "title": task.get("name") or "Задание Flyer", "type": "channel", "reward": reward_units, "completed": False, "raw": task
+        })
+    return result, res, "Flyer"
+    """
 
-        result = []
-        for task in res.get("result", []):
-            if task.get("status") == "completed": continue
-            price = int(task.get("price", 0))
-            # Начисляем процент от цены
-            reward_units = int(price * STARS_SCALE * percent) if price > 0 else 1000
-            result.append({
-                "source": "flyer", "id": str(task.get("signature")), "url": task.get("link"),
-                "title": task.get("name") or "Задание Flyer", "type": "channel", "reward": reward_units, "completed": False, "raw": task
-            })
-        return result
-    except Exception as e:
-        logger.error(f"Ошибка Flyer: {e}")
-        return []
 
-async def _get_all_tasks(db: Any, user_id: int, from_user: Any) -> list[dict[str, Any]]:
+async def _get_all_tasks(db: Any, user_id: int, from_user: Any, settings: Any, bot: Bot) -> list[dict[str, Any]]:
     tasks = []
+    errors = []
+    debug_reports = []
 
-    # 1. Задания из БД
+    # 1. Задания из БД (включая тестовое)
     db_tasks, _ = await db.paginate_tasks(user_id, 1, 1000)
     for t in db_tasks:
         if t["is_completed"]: continue
@@ -236,26 +226,41 @@ async def _get_all_tasks(db: Any, user_id: int, from_user: Any) -> list[dict[str
     try:
         results = await asyncio.wait_for(
             asyncio.gather(
-                _fetch_tgrass(user_id, from_user, db), # Передали db
+                _fetch_tgrass(user_id, from_user, db),
                 _fetch_botohub(user_id, db),
-                _fetch_flyer(user_id, from_user, db),  # Передали db
+                _fetch_flyer(user_id, from_user, db),
                 return_exceptions=True
             ),
             timeout=API_TIMEOUT
         )
         for res in results:
             if isinstance(res, Exception):
-                logger.error(f"API заданий вернул ошибку: {res}")
-                continue
-            tasks.extend(res)
+                errors.append(str(res))
+            else:
+                api_tasks, raw_data, api_name = res
+                tasks.extend(api_tasks)
+                if not api_tasks:
+                    debug_reports.append(f"<b>{api_name}</b> вернул пусто. Ответ: {escape(str(raw_data))[:1000]}")
     except asyncio.TimeoutError:
-        logger.warning(f"Превышено время ожидания ответа от API заданий ({API_TIMEOUT} сек).")
+        errors.append(f"Превышено время ожидания ({API_TIMEOUT} сек)")
+
+    # 3. Если пусто и есть отчеты
+    if not tasks and int(user_id) in getattr(settings, "admin_ids", frozenset()):
+        msg = "🛠 <b>Диагностика заданий</b>\n\n"
+        if errors:
+            msg += "⚠️ <b>Ошибки:</b>\n" + "\n".join(errors) + "\n\n"
+        if debug_reports:
+            msg += "ℹ️ <b>Ответы API:</b>\n" + "\n\n".join(debug_reports) + "\n\n"
+        if not errors and not debug_reports:
+            msg += "Нет заданий."
+
+        await bot.send_message(user_id, msg)
 
     return tasks
 
 
-async def _show_tasks_page(message: Message, db: Any, user: dict[str, Any], from_user: Any, page: int = 1) -> None:
-    all_tasks = await _get_all_tasks(db, int(user["id"]), from_user)
+async def _show_tasks_page(message: Message, db: Any, settings: Any, user: dict[str, Any], from_user: Any, bot: Bot, page: int = 1) -> None:
+    all_tasks = await _get_all_tasks(db, int(user["id"]), from_user, settings, bot)
 
     if not all_tasks:
         await safe_edit(message, await get_text(db, "tasks_empty"), back_to_main())
@@ -345,7 +350,7 @@ async def _required_tasks_text(db: Any) -> int:
 @router.callback_query(
     F.data.in_({"menu:main", "menu:tasks", "menu:balance", "menu:referral", "menu:bonus", "menu:profile"})
 )
-async def cb_main_menu(callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any], state: FSMContext) -> None:
+async def cb_main_menu(callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any], state: FSMContext, bot: Bot) -> None:
     await callback.answer()
     await state.clear()
     action = (callback.data or "menu:main").split(":")[1]
@@ -356,7 +361,7 @@ async def cb_main_menu(callback: CallbackQuery, db: Any, settings: Any, user: di
 
     if action == "tasks":
         await safe_edit(callback.message, "⏳ <i>Загружаем список заданий, пожалуйста подождите...</i>")
-        await _show_tasks_page(callback.message, db, fresh, callback.from_user, page=1)
+        await _show_tasks_page(callback.message, db, settings, fresh, callback.from_user, bot, page=1)
     elif action == "main":
         await _show_main_menu(callback.message, db, settings, fresh)
     elif action == "balance":
@@ -420,7 +425,7 @@ async def cb_bonus_roll(callback: CallbackQuery, db: Any, user: dict[str, Any], 
 
 # ---------------------------------------------------------------------- пагинация заданий
 @router.callback_query(F.data.startswith("tasks:page:"))
-async def cb_tasks_page(callback: CallbackQuery, db: Any, user: dict[str, Any]) -> None:
+async def cb_tasks_page(callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any], bot: Bot) -> None:
     await callback.answer()
     parts = _parse_callback(callback.data or "", 3, 4)
     if parts is None or callback.message is None:
@@ -433,7 +438,7 @@ async def cb_tasks_page(callback: CallbackQuery, db: Any, user: dict[str, Any]) 
             page = 1
         await safe_edit(callback.message, "⏳ <i>Обновляем список заданий...</i>")
         fresh = await db.get_user(int(user["id"])) or user
-        await _show_tasks_page(callback.message, db, fresh, callback.from_user, page=page)
+        await _show_tasks_page(callback.message, db, settings, fresh, callback.from_user, bot, page=page)
     else:
         origin, raw_page = parts[2], parts[3]
         if origin != "bonus":
@@ -452,7 +457,7 @@ async def cb_tasks_page(callback: CallbackQuery, db: Any, user: dict[str, Any]) 
 
 
 @router.callback_query(F.data == "tasks:check")
-async def cb_tasks_check(callback: CallbackQuery, db: Any, user: dict[str, Any]) -> None:
+async def cb_tasks_check(callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any], bot: Bot) -> None:
     await callback.answer("Проверяем...")
     if callback.message is None:
         return
@@ -466,7 +471,7 @@ async def cb_tasks_check(callback: CallbackQuery, db: Any, user: dict[str, Any])
     )
 
     fresh = await db.get_user(int(user["id"])) or user
-    await _show_tasks_page(callback.message, db, fresh, callback.from_user, page=1)
+    await _show_tasks_page(callback.message, db, settings, fresh, callback.from_user, bot, page=1)
 
 
 # ---------------------------------------------------------------------- задания из БД
@@ -671,24 +676,20 @@ async def promo_code(message: Message, state: FSMContext, db: Any, settings: Any
     await message.answer(text, reply_markup=main_menu(is_admin(settings, int(fresh["id"]))))
 
 
-# ------------------------------------------------------------------- Начисления (С РЕФЕРАЛАМИ И ПРОЦЕНТАМИ)
+# ------------------------------------------------------------------- Начисления
 async def _process_tgrass_payments(db: Any, user_id: int, from_user: Any) -> None:
     try:
         res = await tgrass_client.get_offers(
             user_id=user_id, lang=from_user.language_code or "ru",
-            is_premium=from_user.is_premium or False, username=from_user.username,
-            limit=50
+            is_premium=from_user.is_premium or False, username=from_user.username
         )
         ref = await get_ref_settings(db)
-        percent = await db.get_int_setting("tgrass_percent", 50) / 100.0 # Берем процент
+        reward_units = await db.get_int_setting("tgrass_reward_units", 20000)
 
         for offer in res.get("offers", []):
             if not offer.get("subscribed"): continue
             offer_id = offer.get("offer_id")
             if offer_id is None: continue
-
-            price = float(offer.get("price", 0.0))
-            reward_units = int(price * STARS_SCALE * percent) or 1000 # Считаем с процентом
 
             success = await db.complete_tgrass_offer(user_id, int(offer_id), reward_units)
             if success:
@@ -722,26 +723,4 @@ async def _process_botohub_payments(db: Any, user_id: int) -> None:
 
 
 async def _process_flyer_payments(db: Any, user_id: int, from_user: Any) -> None:
-    try:
-        res = await flyer_client.get_tasks(
-            user_id=user_id, language_code=from_user.language_code or "ru", limit=50
-        )
-        ref = await get_ref_settings(db)
-        percent = await db.get_int_setting("flyer_percent", 50) / 100.0 # Берем процент
-
-        for task in res.get("result", []):
-            if task.get("status") != "completed": continue
-            signature = task.get("signature")
-            if not signature: continue
-
-            price = int(task.get("price", 0))
-            reward_units = int(price * STARS_SCALE * percent) if price > 0 else 1000 # Считаем с процентом
-
-            success = await db.complete_flyer_task(user_id, str(signature), reward_units)
-            if success:
-                await db.apply_referral_rewards(
-                    user_id, reward_units,
-                    required_tasks=ref["required_tasks"], bonus=ref["bonus_units"], percent=ref["percent"]
-                )
-    except Exception:
-        pass
+    return # Flyer пока отключен
