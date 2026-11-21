@@ -128,7 +128,58 @@ class BotohubClient:
             logger.error("BotoHub API ошибка: %s", exc)
             raise
 
-# ------------------------------------------------------------------- FLYER
+# ------------------------------------------------------------------- DARKBOOST
+class DarkBoostClient:
+    """Клиент для работы с API DarkBoost."""
+
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+        self.base_url = "https://darkboosts.com"
+        self.headers = {
+            "Auth": self.api_key,
+            "Content-Type": "application/json",
+        }
+
+    async def get_sponsors(self, user_id: int, chat_id: int, max_sponsors: int = 5) -> dict[str, Any]:
+        payload = {
+            "user_id": int(user_id),
+            "chat_id": int(chat_id),
+            "max_sponsors": int(max_sponsors),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/api/v1/sponsors",
+                    json=payload,
+                    headers=self.headers,
+                )
+                response.raise_for_status()
+                data = response.json()
+                logger.info("DarkBoost API /sponsors ответ: %s", data)
+                return data
+        except httpx.HTTPError as exc:
+            logger.error("DarkBoost API /sponsors ошибка: %s", exc)
+            raise
+
+    async def check(self, user_id: int, session_id: str | int) -> dict[str, Any]:
+        payload = {
+            "user_id": int(user_id),
+            "session_id": session_id,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/api/v1/check",
+                    json=payload,
+                    headers=self.headers,
+                )
+                response.raise_for_status()
+                return response.json()
+        except httpx.HTTPError as exc:
+            logger.error("DarkBoost API /check ошибка: %s", exc)
+            raise
+
+# ------------------------------------------------------------------- FLYER (Временно отключен)
 class FlyerClient:
     """Клиент для работы с API Flyer."""
 
@@ -157,23 +208,6 @@ class FlyerClient:
             logger.error("Flyer API /get_tasks ошибка: %s", exc)
             raise
 
-    async def check_task(self, signature: str) -> dict[str, Any]:
-        payload = {
-            "key": self.api_key,
-            "signature": signature,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                response = await client.post(
-                    f"{self.base_url}/check_task",
-                    json=payload,
-                )
-                response.raise_for_status()
-                return response.json()
-        except httpx.HTTPError as exc:
-            logger.error("Flyer API /check_task ошибка: %s", exc)
-            raise
-
 
 _settings = load_settings()
 tgrass_client = TgrassClient(
@@ -181,6 +215,7 @@ tgrass_client = TgrassClient(
     base_url=_settings.tgrass_api_url,
 )
 botohub_client = BotohubClient(_settings.botohub_api_token)
+darkboost_client = DarkBoostClient(_settings.darkboost_api_key) # <--- ДОБАВЛЕНО
 flyer_client = FlyerClient(_settings.flyer_api_key)
 
 

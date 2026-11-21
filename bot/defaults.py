@@ -121,10 +121,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "price_view_units": "345",
     "price_show_units": "860",
     "sponsor_channels": "",
-    "botohub_reward_units": "10000",  # 1 ⭐ (фиксированная награда)
+    "botohub_reward_units": "10000",  # 1 ⭐
+    "tgrass_reward_units": "20000",   # 2 ⭐
+    "flyer_reward_units": "20000",    # 2 ⭐
+    "darkboost_reward_units": "20000", # <--- 2 ⭐ за каждого спонсора DarkBoost
     "partner_channel_url": "",
-    "tgrass_percent": "50", # <-- НОВОЕ: Процент от цены Tgrass
-    "flyer_percent": "50",  # <-- НОВОЕ: Процент от цены Flyer
 }
 
 SETTINGS_TITLES: dict[str, str] = {
@@ -138,8 +139,9 @@ SETTINGS_TITLES: dict[str, str] = {
     "price_show_units": "Цена показа",
     "sponsor_channels": "Спонсоры (обязательная подписка)",
     "botohub_reward_units": "Награда за задание BotoHub",
-    "tgrass_percent": "Процент награды Tgrass (%)", # <-- НОВОЕ
-    "flyer_percent": "Процент награды Flyer (%)",   # <-- НОВОЕ
+    "tgrass_reward_units": "Награда за задание Tgrass",
+    "flyer_reward_units": "Награда за задание Flyer",
+    "darkboost_reward_units": "Награда за 1 спонсора DarkBoost", # <--- ДОБАВЛЕНО
 }
 
 STAR_UNIT_SETTINGS: frozenset[str] = frozenset(
@@ -151,6 +153,9 @@ STAR_UNIT_SETTINGS: frozenset[str] = frozenset(
         "price_view_units",
         "price_show_units",
         "botohub_reward_units",
+        "tgrass_reward_units",
+        "flyer_reward_units",
+        "darkboost_reward_units",
     }
 )
 

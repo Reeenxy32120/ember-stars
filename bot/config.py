@@ -47,6 +47,7 @@ class Settings:
     tgrass_api_key: str = ""
     tgrass_api_url: str = "https://tgrass.space"
     botohub_api_token: str = ""
+    darkboost_api_key: str = ""  # <--- ДОБАВЛЕНО
 
     @property
     def is_admin_configured(self) -> bool:
@@ -100,4 +101,5 @@ def load_settings(env_file: Path | None = None) -> Settings:
         tgrass_api_key=os.getenv("TGRASS_API_KEY", "").strip(),
         tgrass_api_url=os.getenv("TGRASS_API_URL", "https://tgrass.space").strip(),
         botohub_api_token=os.getenv("BOTOHUB_TOKEN", "").strip(),
+        darkboost_api_key=os.getenv("DARKBOOST_API_KEY", "").strip(), # <--- ДОБАВЛЕНО
     )

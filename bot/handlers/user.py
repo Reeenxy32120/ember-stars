@@ -6,6 +6,7 @@ import asyncio
 import html
 import logging
 import math
+import time  # <--- ДОБАВЛЕНО ДЛЯ КЭША
 from typing import Any
 
 from aiogram import Bot, F, Router
@@ -62,8 +63,12 @@ logger = logging.getLogger(__name__)
 
 router = Router(name="user")
 
-TASKS_PER_PAGE = 8
+TASKS_PER_PAGE = 10
 API_TIMEOUT = 15.0
+
+# --- КЭШ ЗАДАНИЙ (чтобы не спамить API и грузить мгновенно) ---
+API_CACHE: dict[int, tuple[float, list[dict]]] = {}
+CACHE_TTL = 180  # Обновлять задания от API раз в 3 минуты
 
 
 # --------------------------------------------------------------------- helpers
@@ -144,7 +149,6 @@ async def _notify_referrer(bot: Bot, referrer_id: int, payout: dict[str, Any], t
 
 # ------------------------------------------------------------------ Загрузка заданий
 async def _fetch_tgrass(user_id: int, from_user: Any, db: Any) -> tuple[list[dict], Any, str]:
-    # Убрали limit, чтобы не было ошибки
     res = await tgrass_client.get_offers(
         user_id=user_id,
         lang=from_user.language_code or "ru",
@@ -188,24 +192,7 @@ async def _fetch_botohub(user_id: int, db: Any) -> tuple[list[dict], Any, str]:
     return all_tasks, last_res, "BotoHub"
 
 async def _fetch_flyer(user_id: int, from_user: Any, db: Any) -> tuple[list[dict], Any, str]:
-    # Временно отключен, так как домен api.flyerservice.io не отвечает (DNS error)
     return [], {"error": "Flyer API domain is dead"}, "Flyer"
-
-    # Если сервис оживет, просто раскомментируй код ниже, а строку return выше удали:
-    """
-    res = await flyer_client.get_tasks(
-        user_id=user_id, language_code=from_user.language_code or "ru", limit=50
-    )
-    reward_units = await db.get_int_setting("flyer_reward_units", 20000)
-    result = []
-    for task in res.get("result", []):
-        if task.get("status") == "completed": continue
-        result.append({
-            "source": "flyer", "id": str(task.get("signature")), "url": task.get("link"),
-            "title": task.get("name") or "Задание Flyer", "type": "channel", "reward": reward_units, "completed": False, "raw": task
-        })
-    return result, res, "Flyer"
-    """
 
 
 async def _get_all_tasks(db: Any, user_id: int, from_user: Any, settings: Any, bot: Bot) -> list[dict[str, Any]]:
@@ -213,7 +200,7 @@ async def _get_all_tasks(db: Any, user_id: int, from_user: Any, settings: Any, b
     errors = []
     debug_reports = []
 
-    # 1. Задания из БД (включая тестовое)
+    # 1. Задания из БД (быстрые, без сети)
     db_tasks, _ = await db.paginate_tasks(user_id, 1, 1000)
     for t in db_tasks:
         if t["is_completed"]: continue
@@ -222,7 +209,15 @@ async def _get_all_tasks(db: Any, user_id: int, from_user: Any, settings: Any, b
             "type": t["type"], "reward": int(t["reward"]), "completed": False, "raw": t
         })
 
-    # 2. Внешние API
+    # 2. Проверяем кэш
+    now = time.time()
+    if int(user_id) in API_CACHE:
+        cached_time, cached_tasks = API_CACHE[int(user_id)]
+        if now - cached_time < CACHE_TTL:
+            tasks.extend(cached_tasks)
+            return tasks  # Мгновенный возврат из кэша!
+
+    # 3. Если кэш пуст или устарел — идем в API
     try:
         results = await asyncio.wait_for(
             asyncio.gather(
@@ -233,18 +228,24 @@ async def _get_all_tasks(db: Any, user_id: int, from_user: Any, settings: Any, b
             ),
             timeout=API_TIMEOUT
         )
+        api_tasks = []
         for res in results:
             if isinstance(res, Exception):
                 errors.append(str(res))
             else:
-                api_tasks, raw_data, api_name = res
-                tasks.extend(api_tasks)
-                if not api_tasks:
-                    debug_reports.append(f"<b>{api_name}</b> вернул пусто. Ответ: {escape(str(raw_data))[:1000]}")
+                fetched_tasks, raw_data, api_name = res
+                api_tasks.extend(fetched_tasks)
+                if not fetched_tasks:
+                    debug_reports.append(f"<b>{api_name}</b> вернул пусто.")
+
+        # Сохраняем в кэш
+        API_CACHE[int(user_id)] = (now, api_tasks)
+        tasks.extend(api_tasks)
+
     except asyncio.TimeoutError:
         errors.append(f"Превышено время ожидания ({API_TIMEOUT} сек)")
 
-    # 3. Если пусто и есть отчеты
+    # 4. Диагностика (если пусто и это админ)
     if not tasks and int(user_id) in getattr(settings, "admin_ids", frozenset()):
         msg = "🛠 <b>Диагностика заданий</b>\n\n"
         if errors:
@@ -253,7 +254,6 @@ async def _get_all_tasks(db: Any, user_id: int, from_user: Any, settings: Any, b
             msg += "ℹ️ <b>Ответы API:</b>\n" + "\n\n".join(debug_reports) + "\n\n"
         if not errors and not debug_reports:
             msg += "Нет заданий."
-
         await bot.send_message(user_id, msg)
 
     return tasks
@@ -266,13 +266,12 @@ async def _show_tasks_page(message: Message, db: Any, settings: Any, user: dict[
         await safe_edit(message, await get_text(db, "tasks_empty"), back_to_main())
         return
 
-    per_page = 5
     total = len(all_tasks)
-    pages = max(1, math.ceil(total / per_page))
+    pages = max(1, math.ceil(total / TASKS_PER_PAGE))
     page = max(1, min(page, pages))
 
-    start = (page - 1) * per_page
-    page_tasks = all_tasks[start:start + per_page]
+    start = (page - 1) * TASKS_PER_PAGE
+    page_tasks = all_tasks[start:start + TASKS_PER_PAGE]
 
     text = render(
         await get_text(db, "tasks_combined"),
@@ -360,7 +359,16 @@ async def cb_main_menu(callback: CallbackQuery, db: Any, settings: Any, user: di
         return
 
     if action == "tasks":
-        await safe_edit(callback.message, "⏳ <i>Загружаем список заданий, пожалуйста подождите...</i>")
+        # Если в кэше есть свежие данные, не показываем загрузку
+        is_cached = False
+        if int(fresh["id"]) in API_CACHE:
+            cached_time, _ = API_CACHE[int(fresh["id"])]
+            if time.time() - cached_time < CACHE_TTL:
+                is_cached = True
+
+        if not is_cached:
+            await safe_edit(callback.message, "⏳ <i>Загружаем список заданий...</i>")
+
         await _show_tasks_page(callback.message, db, settings, fresh, callback.from_user, bot, page=1)
     elif action == "main":
         await _show_main_menu(callback.message, db, settings, fresh)
@@ -436,7 +444,17 @@ async def cb_tasks_page(callback: CallbackQuery, db: Any, settings: Any, user: d
             page = int(parts[2])
         except ValueError:
             page = 1
-        await safe_edit(callback.message, "⏳ <i>Обновляем список заданий...</i>")
+
+        # Проверяем кэш перед обновлением
+        is_cached = False
+        if int(user["id"]) in API_CACHE:
+            cached_time, _ = API_CACHE[int(user["id"])]
+            if time.time() - cached_time < CACHE_TTL:
+                is_cached = True
+
+        if not is_cached:
+            await safe_edit(callback.message, "⏳ <i>Обновляем список заданий...</i>")
+
         fresh = await db.get_user(int(user["id"])) or user
         await _show_tasks_page(callback.message, db, settings, fresh, callback.from_user, bot, page=page)
     else:
@@ -463,6 +481,10 @@ async def cb_tasks_check(callback: CallbackQuery, db: Any, settings: Any, user: 
         return
 
     await safe_edit(callback.message, "⏳ <i>Проверяем выполнение заданий...</i>")
+
+    # Очищаем кэш пользователя, так как после проверки задания могли измениться
+    if int(user["id"]) in API_CACHE:
+        del API_CACHE[int(user["id"])]
 
     await asyncio.gather(
         _process_tgrass_payments(db, int(user["id"]), callback.from_user),
@@ -723,4 +745,4 @@ async def _process_botohub_payments(db: Any, user_id: int) -> None:
 
 
 async def _process_flyer_payments(db: Any, user_id: int, from_user: Any) -> None:
-    return # Flyer пока отключен
+    return
