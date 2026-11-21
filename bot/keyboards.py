@@ -12,6 +12,7 @@ from bot.defaults import (
     STAR_UNIT_SETTINGS,
     TASK_TYPE_LABELS,
     TEXT_TITLES,
+    WITHDRAW_GIFTS,
 )
 from bot.utils import STARS_SCALE, build_share_url, format_units, sponsor_url, truncate
 
@@ -120,7 +121,7 @@ def tasks_back(origin: str = "tasks") -> InlineKeyboardMarkup:
 def balance_menu() -> InlineKeyboardMarkup:
     return _kb(
         [
-            [_button("💸 Создать заявку на вывод", "withdraw:start")],
+            [_button("🎁 Вывести звёзды", "withdraw:start")],
             [_button("🧾 История начислений", "balance:history")],
             [_button("← Главная", "menu:main")],
         ]
@@ -129,8 +130,41 @@ def balance_menu() -> InlineKeyboardMarkup:
 def history_menu() -> InlineKeyboardMarkup:
     return _kb([[_button("← К балансу", "menu:balance")]])
 
+# ------------------------------------------------------------------ ВЫВОД (ПОДАРКИ)
+def withdraw_gifts_menu(user_balance: int, friends_count: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    current_row: list[InlineKeyboardButton] = []
+
+    for gift in WITHDRAW_GIFTS:
+        price_units = gift["price"] * STARS_SCALE
+        is_locked = user_balance < price_units
+        lock_mark = " 🔒" if is_locked else ""
+
+        # Если не хватает друзей для первого вывода
+        if friends_count < 3:
+            lock_mark = " 🔒"
+
+        label = f"{gift['emoji']} {gift['price']}⭐{lock_mark}"
+        callback = f"withdraw:gift:{gift['id']}"
+
+        current_row.append(_button(label, callback))
+
+        if len(current_row) == 3:
+            rows.append(current_row)
+            current_row = []
+
+    if current_row:
+        rows.append(current_row)
+
+    rows.append([_button("📜 История выводов", "withdraw:history")])
+    rows.append([_button("← Назад", "menu:balance")])
+    return _kb(rows)
+
+def withdraw_history_menu() -> InlineKeyboardMarkup:
+    return _kb([[_button("← К подаркам", "withdraw:start")]])
+
 def withdraw_cancel() -> InlineKeyboardMarkup:
-    return _kb([[_button("← Отмена", "withdraw:cancel")]])
+    return _kb([[_button("← Отмена", "menu:balance")]])
 
 def withdrawal_channel_decision(withdrawal_id: int) -> InlineKeyboardMarkup:
     return _kb(
@@ -365,9 +399,10 @@ def admin_task_bonus_menu() -> InlineKeyboardMarkup:
 def admin_withdrawals(items: Sequence[dict], page: int, pages: int) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for item in items:
+        gift_name = item.get("gift", "Подарок")
         rows.append(
             [
-                _button(f"✅ #{int(item['id'])}", f"admin:wd:approve:{int(item['id'])}"),
+                _button(f"✅ #{int(item['id'])} {gift_name}", f"admin:wd:approve:{int(item['id'])}"),
                 _button(f"❌ #{int(item['id'])}", f"admin:wd:reject:{int(item['id'])}"),
             ]
         )
@@ -466,5 +501,5 @@ __all__ = [
     "main_menu", "profile_menu", "promo_cancel", "referral_menu", "sponsor_gate",
     "task_detail", "tasks_back", "tasks_list", "traffic_audience", "traffic_cancel",
     "traffic_categories", "traffic_menu", "traffic_orders_menu", "withdraw_cancel",
-    "withdrawal_channel_decision",
+    "withdrawal_channel_decision", "withdraw_gifts_menu", "withdraw_history_menu",
 ]

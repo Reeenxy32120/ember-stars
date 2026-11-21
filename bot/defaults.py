@@ -107,13 +107,14 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ref_bonus_units": "50000",
     "ref_tasks_required": "6",
     "ref_percent": "10",
-    "min_withdraw_units": "500000",
+    "min_withdraw_units": "150000",  # Изменил на 15 звезд для вывода подарками
     "price_task_units": "6400",
     "price_broadcast_units": "250",
     "price_view_units": "345",
     "price_show_units": "860",
     "sponsor_channels": "",
     "botohub_reward_units": "10000",  # 1 ⭐
+    "partner_channel_url": "",
 }
 
 SETTINGS_TITLES: dict[str, str] = {
@@ -177,3 +178,18 @@ BROADCAST_STATUS_LABELS: dict[str, str] = {
     "paid": "✅ Выплачено",
     "rejected": "❌ Отклонена",
 }
+
+# --- ПОДАРКИ ДЛЯ ВЫВОДА ---
+WITHDRAW_GIFTS: list[dict[str, Any]] = [
+    {"id": "heart", "name": "💝 Сердце", "emoji": "💝", "price": 15},
+    {"id": "bear", "name": "🧸 Мишка", "emoji": "🧸", "price": 15},
+    {"id": "rose", "name": "🌹 Роза", "emoji": "🌹", "price": 25},
+    {"id": "box", "name": "🎁 Подарок", "emoji": "🎁", "price": 25},
+    {"id": "cake", "name": "🎂 Торт", "emoji": "🎂", "price": 50},
+    {"id": "bouquet", "name": "💐 Букет", "emoji": "💐", "price": 50},
+    {"id": "rocket", "name": "🚀 Ракета", "emoji": "🚀", "price": 50},
+    {"id": "champagne", "name": "🍾 Шампанское", "emoji": "🍾", "price": 50},
+    {"id": "cup", "name": "🏆 Кубок", "emoji": "🏆", "price": 100},
+    {"id": "diamond", "name": "💎 Алмаз", "emoji": "💎", "price": 100},
+    {"id": "ring", "name": "💍 Кольцо", "emoji": "💍", "price": 100},
+]

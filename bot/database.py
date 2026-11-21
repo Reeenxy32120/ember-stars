@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     amount INTEGER NOT NULL,
+    gift TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     processed_at TEXT,
@@ -455,7 +456,7 @@ class Database:
         )
 
     # -------------------------------------------------------------- withdrawals
-    async def create_withdrawal(self, user_id: int, amount: int) -> int | None:
+    async def create_withdrawal(self, user_id: int, amount: int, gift: str = "Подарок") -> int | None:
         amount = int(amount)
         if amount <= 0:
             return None
@@ -471,13 +472,13 @@ class Database:
                     await self.conn.rollback()
                     return None
                 insert = await self.conn.execute(
-                    "INSERT INTO withdrawals (user_id, amount, status) VALUES (?, ?, 'pending')",
-                    (int(user_id), amount),
+                    "INSERT INTO withdrawals (user_id, amount, gift, status) VALUES (?, ?, ?, 'pending')",
+                    (int(user_id), amount, gift),
                 )
                 await self.conn.execute(
                     "INSERT INTO transactions (user_id, amount, kind, comment) "
-                    "VALUES (?, ?, 'withdraw', 'Заявка на вывод')",
-                    (int(user_id), -amount),
+                    "VALUES (?, ?, 'withdraw', ?)",
+                    (int(user_id), -amount, f"Вывод: {gift}"),
                 )
                 await self.conn.commit()
                 return int(insert.lastrowid or 0)
@@ -490,6 +491,12 @@ class Database:
             "SELECT w.*, u.username, u.full_name FROM withdrawals w "
             "LEFT JOIN users u ON u.id = w.user_id WHERE w.id = ?",
             (int(withdrawal_id),),
+        )
+
+    async def get_user_withdrawals(self, user_id: int, limit: int = 10) -> list[dict[str, Any]]:
+        return await self._fetchall(
+            "SELECT * FROM withdrawals WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (int(user_id), int(limit)),
         )
 
     async def paginate_withdrawals(

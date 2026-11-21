@@ -1,196 +1,183 @@
-"""Вывод Stars: FSM-заявка на вывод и уведомление администраторов."""
+"""Логика вывода звёзд в виде подарков."""
 
 from __future__ import annotations
 
+import html
 import logging
 from typing import Any
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.fsm.context import FSMContext
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 from aiogram.types import CallbackQuery, Message
 
+from bot.defaults import WITHDRAW_GIFTS
 from bot.keyboards import (
     back_to_main,
-    main_menu,
-    withdraw_cancel,
+    withdraw_gifts_menu,
+    withdraw_history_menu,
     withdrawal_channel_decision,
 )
-from bot.services import get_min_withdraw_units, get_text
-from bot.states import WithdrawStates
-from bot.utils import StarsParseError, escape, format_units, parse_stars, render
+from bot.services import get_min_withdraw_units
+from bot.utils import STARS_SCALE, escape, format_dt, format_units, safe_edit
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="withdraw")
 
+FRIENDS_REQUIRED = 3
 
-def is_admin(settings: Any, user_id: int) -> bool:
-    return int(user_id) in getattr(settings, "admin_ids", frozenset())
+async def _build_withdraw_text(db: Any, user: dict[str, Any]) -> str:
+    balance_units = int(user["balance"])
+    balance_stars = format_units(balance_units)
+
+    # Считаем друзей
+    ref_stats = await db.get_referral_stats(int(user["id"]))
+    friends_count = ref_stats["invited"]
+
+    min_units = await get_min_withdraw_units(db)
+    min_stars = format_units(min_units)
+
+    # Прогресс-бар друзей
+    progress = min(10, int((friends_count / FRIENDS_REQUIRED) * 10))
+    bar = "🟩" * progress + "⬜" * (10 - progress)
+    percent = min(100, int((friends_count / FRIENDS_REQUIRED) * 100))
+
+    mode_text = ""
+    if friends_count < FRIENDS_REQUIRED:
+        mode_text = (
+            f"🚨 Режим: <b>Первый вывод</b> — проверка администратором 🔒\n"
+            f"Для вывода нужно <b>{FRIENDS_REQUIRED}</b> друзей, у тебя {friends_count}\n"
+            f"[{bar}] {percent}%"
+        )
+    else:
+        mode_text = (
+            f"✅ Режим: <b>Обычный вывод</b> — проверка администратором\n"
+            f"Условие по друзьям выполнено ({friends_count}/{FRIENDS_REQUIRED})"
+        )
+
+    return (
+        "🎁 <b>Вывод звёзд подарком</b>\n\n"
+        f"🐊 Баланс: <b>{balance_stars}</b> ⭐ | Минимум: <b>{min_stars}</b> ⭐\n"
+        f"{mode_text}\n\n"
+        "🎁 Выбери подарок — он придёт прямо в твой профиль.\n"
+        "<i>Подарок можно оставить или обменять на звёзды. 🔒 — пока не хватает</i>"
+    )
 
 
 @router.callback_query(F.data == "withdraw:start")
-async def cb_withdraw_start(
-    callback: CallbackQuery,
-    db: Any,
-    user: dict[str, Any],
-    state: FSMContext,
-) -> None:
+async def cb_withdraw_start(callback: CallbackQuery, db: Any, user: dict[str, Any]) -> None:
+    await callback.answer()
     if callback.message is None:
-        await callback.answer()
         return
-    fresh = await db.get_user(int(user["id"]))
-    if fresh is None:
-        await callback.answer("Профиль не найден", show_alert=True)
+
+    fresh = await db.get_user(int(user["id"])) or user
+    text = await _build_withdraw_text(db, fresh)
+    ref_stats = await db.get_referral_stats(int(user["id"]))
+
+    await safe_edit(
+        callback.message,
+        text,
+        withdraw_gifts_menu(int(fresh["balance"]), ref_stats["invited"])
+    )
+
+
+@router.callback_query(F.data.startswith("withdraw:gift:"))
+async def cb_withdraw_gift(callback: CallbackQuery, db: Any, user: dict[str, Any], bot: Bot, settings: Any) -> None:
+    gift_id = (callback.data or "").split(":")[2]
+    gift = next((g for g in WITHDRAW_GIFTS if g["id"] == gift_id), None)
+    if not gift:
+        await callback.answer("Подарок не найден", show_alert=True)
         return
-    balance = int(fresh["balance"])
-    min_withdraw = await get_min_withdraw_units(db)
-    if balance < min_withdraw:
+
+    fresh = await db.get_user(int(user["id"])) or user
+    balance_units = int(fresh["balance"])
+    price_units = gift["price"] * STARS_SCALE
+    ref_stats = await db.get_referral_stats(int(user["id"]))
+
+    if ref_stats["invited"] < FRIENDS_REQUIRED:
         await callback.answer(
-            f"Недостаточно Stars. Минимум для вывода — "
-            f"{format_units(min_withdraw)} ⭐, у тебя {format_units(balance)} ⭐.",
+            f"Для первого вывода нужно пригласить {FRIENDS_REQUIRED} друзей. У тебя {ref_stats['invited']}.",
             show_alert=True,
         )
         return
 
-    await state.set_state(WithdrawStates.waiting_amount)
-    template = await get_text(db, "withdraw_ask")
-    text = render(
-        template,
-        min_withdraw=format_units(min_withdraw),
-        balance=format_units(balance),
+    if balance_units < price_units:
+        await callback.answer("Недостаточно звёзд на балансе", show_alert=True)
+        return
+
+    # Создаем заявку
+    withdrawal_id = await db.create_withdrawal(int(user["id"]), price_units, gift["name"])
+    if not withdrawal_id:
+        await callback.answer("Ошибка при создании заявки. Попробуй позже.", show_alert=True)
+        return
+
+    await callback.answer("Заявка создана!", show_alert=False)
+
+    # Текст для юзера
+    success_text = (
+        "✅ <b>Заявка на вывод создана!</b>\n\n"
+        f"🎁 Подарок: <b>{gift['name']}</b>\n"
+        f"💰 Сумма: <b>{gift['price']}</b> ⭐\n\n"
+        "Ожидай проверки администратором."
     )
-    await callback.answer()
-    await callback.message.answer(text, reply_markup=withdraw_cancel())
+    if callback.message:
+        await safe_edit(callback.message, success_text, back_to_main("← В меню"))
 
-
-@router.message(WithdrawStates.waiting_amount)
-async def withdraw_amount(
-    message: Message,
-    state: FSMContext,
-    db: Any,
-    settings: Any,
-    user: dict[str, Any],
-    bot: Bot,
-) -> None:
-    fresh = await db.get_user(int(user["id"]))
-    if fresh is None:
-        await state.clear()
-        await message.answer("Профиль не найден. Открой /start.")
-        return
-    balance = int(fresh["balance"])
-    min_withdraw = await get_min_withdraw_units(db)
-
-    try:
-        amount = parse_stars(message.text or "")
-    except StarsParseError as exc:
-        await message.answer(f"⚠️ {escape(str(exc))}\n\nВведи сумму в Stars, например {format_units(min_withdraw)}.")
-        return
-
-    if amount < min_withdraw:
-        await message.answer(
-            f"⚠️ Минимальная сумма вывода — <b>{format_units(min_withdraw)}</b> ⭐.",
-            reply_markup=withdraw_cancel(),
-        )
-        return
-    if amount > balance:
-        await message.answer(
-            f"⚠️ На балансе только <b>{format_units(balance)}</b> ⭐. Введи сумму меньше.",
-            reply_markup=withdraw_cancel(),
-        )
-        return
-
-    withdrawal_id = await db.create_withdrawal(int(user["id"]), amount)
-    if withdrawal_id is None:
-        await message.answer(
-            "⚠️ Не удалось создать заявку: недостаточно Stars. Попробуй меньшую сумму.",
-            reply_markup=withdraw_cancel(),
-        )
-        return
-
-    await state.clear()
-    template = await get_text(db, "withdraw_created")
-    await message.answer(
-        render(template, amount=format_units(amount)),
-        reply_markup=main_menu(is_admin(settings, int(user["id"]))),
-    )
-
-    username = f"@{fresh['username']}" if fresh.get("username") else "—"
+    # Отправка в канал или админам
     admin_text = (
-        "💸 <b>Новая заявка на вывод</b>\n\n"
+        "💸 <b>Новая заявка на вывод!</b>\n\n"
         f"🆔 Заявка: <b>#{withdrawal_id}</b>\n"
-        f"👤 Пользователь: {escape(str(fresh['full_name']))} ({escape(username)})\n"
-        f"🆔 ID: <code>{int(fresh['id'])}</code>\n"
-        f"⭐ Сумма: <b>{format_units(amount)}</b> ⭐\n\n"
-        "Обработать: раздел «Заявки на вывод» в /admin."
+        f"👤 Пользователь: {escape(fresh.get('full_name') or '')} (ID: <code>{user['id']}</code>)\n"
+        f"🎁 Подарок: <b>{gift['name']}</b>\n"
+        f"💰 Сумма: <b>{gift['price']}</b> ⭐\n\n"
+        "Обработать можно в /admin -> Заявки на вывод."
     )
-    channel_text = (
-        "💸 <b>Новая заявка на вывод</b>\n\n"
-        f"🆔 Заявка: <b>#{withdrawal_id}</b>\n"
-        f"👤 Пользователь: {escape(str(fresh['full_name']))} ({escape(username)})\n"
-        f"🆔 ID: <code>{int(fresh['id'])}</code>\n"
-        f"⭐ Сумма: <b>{format_units(amount)}</b> ⭐\n\n"
-        "Нажми кнопку ниже после выплаты или отклонения заявки."
-    )
-    for admin_id in getattr(settings, "admin_ids", frozenset()):
-        try:
-            await bot.send_message(admin_id, admin_text)
-        except (TelegramForbiddenError, TelegramBadRequest):
-            logger.debug("Не удалось уведомить админа %s", admin_id)
 
-    channel = getattr(settings, "withdraw_channel", "")
-    if channel:
+    sent_to_channel = False
+    if getattr(settings, "withdraw_channel", None):
         try:
             await bot.send_message(
-                channel,
-                channel_text,
-                reply_markup=withdrawal_channel_decision(withdrawal_id),
+                chat_id=settings.withdraw_channel,
+                text=admin_text,
+                reply_markup=withdrawal_channel_decision(withdrawal_id)
             )
-        except (TelegramForbiddenError, TelegramBadRequest):
-            logger.exception(
-                "Не удалось отправить заявку #%s в канал выплат %s",
-                withdrawal_id,
-                channel,
-            )
+            sent_to_channel = True
+        except Exception as e:
+            logger.error(f"Не удалось отправить заявку в канал: {e}")
+
+    if not sent_to_channel:
+        for admin_id in getattr(settings, "admin_ids", frozenset()):
+            try:
+                await bot.send_message(admin_id, admin_text)
+            except (TelegramForbiddenError, TelegramBadRequest):
+                pass
 
 
-@router.callback_query(F.data == "withdraw:cancel")
-async def cb_withdraw_cancel(
-    callback: CallbackQuery,
-    state: FSMContext,
-    db: Any,
-    settings: Any,
-    user: dict[str, Any],
-) -> None:
-    await state.clear()
-    await callback.answer("Заявка отменена")
+@router.callback_query(F.data == "withdraw:history")
+async def cb_withdraw_history(callback: CallbackQuery, db: Any, user: dict[str, Any]) -> None:
+    await callback.answer()
     if callback.message is None:
         return
-    fresh = await db.get_user(int(user["id"])) or user
-    try:
-        await callback.message.edit_text(
-            "❌ Создание заявки отменено.",
-            reply_markup=back_to_main(),
-        )
-    except TelegramBadRequest:
-        await safe_answer_main(callback, db, settings, fresh)
 
+    withdrawals = await db.get_user_withdrawals(int(user["id"]), limit=10)
+    if not withdrawals:
+        text = "📜 <b>История выводов</b>\n\nУ тебя пока нет заявок на вывод."
+    else:
+        lines = ["📜 <b>История выводов</b>\n"]
+        for w in withdrawals:
+            gift = w.get("gift") or "Подарок"
+            status = w.get("status")
+            amount = format_units(int(w["amount"]))
+            dt = format_dt(str(w.get("created_at") or ""))
 
-async def safe_answer_main(
-    callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any]
-) -> None:
-    """Запасной путь, если сообщение нельзя отредактировать."""
-    if callback.message is None:
-        return
-    try:
-        from bot.handlers.user import main_menu_text
+            if status == "pending":
+                icon = "⏳"
+            elif status == "paid":
+                icon = "✅"
+            else:
+                icon = "❌"
 
-        await callback.message.answer(
-            await main_menu_text(db, user),
-            reply_markup=main_menu(is_admin(settings, int(user["id"]))),
-        )
-    except TelegramBadRequest:
-        logger.debug("Не удалось отправить главное меню", exc_info=True)
+            lines.append(f"{icon} {gift} — <b>{amount}</b> ⭐ ({dt})")
+        text = "\n".join(lines)
 
-
-__all__ = ["router", "withdraw_amount"]
+    await safe_edit(callback.message, text, withdraw_history_menu())
