@@ -63,7 +63,7 @@ class TgrassClient:
             payload["tg_login"] = username.lstrip("@")
 
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await client.post(
                     f"{self.base_url}/offers",
                     json=payload,
@@ -83,7 +83,7 @@ class TgrassClient:
             "offer_id": int(offer_id),
         }
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await client.post(
                     f"{self.base_url}/check",
                     json=payload,
@@ -107,10 +107,14 @@ class BotohubClient:
             "Content-Type": "application/json",
         }
 
-    async def get_tasks(self, chat_id: int) -> dict[str, Any]:
-        payload = {"chat_id": int(chat_id)}
+    async def get_tasks(self, chat_id: int, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        payload = {
+            "chat_id": int(chat_id),
+            "limit": int(limit),
+            "offset": int(offset),
+        }
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await client.post(
                     f"{self.base_url}/get-tasks-extended",
                     json=payload,
@@ -132,7 +136,7 @@ class FlyerClient:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
 
-    async def get_tasks(self, user_id: int, language_code: str = "ru", limit: int = 5) -> dict[str, Any]:
+    async def get_tasks(self, user_id: int, language_code: str = "ru", limit: int = 50) -> dict[str, Any]:
         payload = {
             "key": self.api_key,
             "user_id": int(user_id),
@@ -140,7 +144,7 @@ class FlyerClient:
             "limit": limit,
         }
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await client.post(
                     f"{self.base_url}/get_tasks",
                     json=payload,
@@ -159,7 +163,7 @@ class FlyerClient:
             "signature": signature,
         }
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await client.post(
                     f"{self.base_url}/check_task",
                     json=payload,
