@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 DEFAULT_TEXTS: dict[str, str] = {
     "greeting": (
         "👋 <b>Привет, {name}!</b>\n\n"
@@ -19,6 +21,11 @@ DEFAULT_TEXTS: dict[str, str] = {
     "tasks_empty": (
         "🙈 Пока нет доступных заданий.\n"
         "Загляни позже — новые задания появляются регулярно."
+    ),
+    "daily_bonus": (
+        "🎁 <b>Ежедневный бонус</b>\n\n"
+        "Каждые 24 часа ты можешь бросить кубик и получить от 1 до 6 ⭐!\n\n"
+        "Статус: {status}"
     ),
     "bonus": (
         "🎁 <b>Бонус</b>\n\n"
@@ -94,7 +101,8 @@ TEXT_TITLES: dict[str, str] = {
     "balance": "Раздел «Баланс»",
     "referral": "Реферальный раздел",
     "referral_join": "Сообщение при реф-переходе",
-    "bonus": "Раздел «Бонус»",
+    "daily_bonus": "Ежедневный бонус (Кубик)",
+    "bonus": "Раздел «Бонус» (Задания)",
     "profile": "Раздел «Профиль»",
     "traffic": "Раздел «Покупка трафика»",
     "withdraw_ask": "Запрос суммы вывода",
@@ -107,7 +115,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ref_bonus_units": "50000",
     "ref_tasks_required": "6",
     "ref_percent": "10",
-    "min_withdraw_units": "150000",  # Изменил на 15 звезд для вывода подарками
+    "min_withdraw_units": "150000",  # Минимум 15 звезд
     "price_task_units": "6400",
     "price_broadcast_units": "250",
     "price_view_units": "345",

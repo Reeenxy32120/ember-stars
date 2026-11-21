@@ -18,13 +18,14 @@ from bot.keyboards import (
     withdrawal_channel_decision,
 )
 from bot.services import get_min_withdraw_units
-from bot.utils import STARS_SCALE, escape, format_dt, format_units, safe_edit
+from bot.utils import STARS_SCALE, escape, format_dt, format_units, normalize_chat_ref, safe_edit
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="withdraw")
 
 FRIENDS_REQUIRED = 3
+
 
 async def _build_withdraw_text(db: Any, user: dict[str, Any]) -> str:
     balance_units = int(user["balance"])
@@ -134,21 +135,37 @@ async def cb_withdraw_gift(callback: CallbackQuery, db: Any, user: dict[str, Any
     )
 
     sent_to_channel = False
-    if getattr(settings, "withdraw_channel", None):
+    raw_channel = getattr(settings, "withdraw_channel", None)
+
+    if raw_channel:
+        # Очищаем ссылку от https://t.me/, оставляя @username
+        channel_ref = normalize_chat_ref(raw_channel)
         try:
             await bot.send_message(
-                chat_id=settings.withdraw_channel,
+                chat_id=channel_ref,
                 text=admin_text,
                 reply_markup=withdrawal_channel_decision(withdrawal_id)
             )
             sent_to_channel = True
         except Exception as e:
-            logger.error(f"Не удалось отправить заявку в канал: {e}")
+            error_msg = f"⚠️ Не удалось отправить заявку в канал ({channel_ref}).\nОшибка: <code>{escape(str(e))}</code>\n\nПроверь, что бот админ в канале и WITHDRAW_CHANNEL в .env указан верно."
+            logger.error(error_msg)
+            # Если в канал отправить не удалось, кидаем ошибку админам в ЛС
+            for admin_id in getattr(settings, "admin_ids", frozenset()):
+                try:
+                    await bot.send_message(admin_id, error_msg)
+                except:
+                    pass
 
+    # Если канал не настроен или произошла ошибка — кидаем заявку в ЛС админам
     if not sent_to_channel:
         for admin_id in getattr(settings, "admin_ids", frozenset()):
             try:
-                await bot.send_message(admin_id, admin_text)
+                await bot.send_message(
+                    admin_id,
+                    admin_text,
+                    reply_markup=withdrawal_channel_decision(withdrawal_id)
+                )
             except (TelegramForbiddenError, TelegramBadRequest):
                 pass
 

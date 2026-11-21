@@ -24,6 +24,7 @@ TRANSACTION_KIND_LABELS = {
     "promo": "🎟 Промокод",
     "admin": "🛠 Начисление админа",
     "order_refund": "↩️ Возврат за заказ",
+    "daily_bonus": "🎲 Ежедневный бонус",
 }
 
 

@@ -57,6 +57,19 @@ def main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
 def back_to_main(text: str = "← Главная") -> InlineKeyboardMarkup:
     return _kb([[_button(text, "menu:main")]])
 
+# ---------------------------------------------------------------- ЕЖЕДНЕВНЫЙ БОНУС (КУБИК)
+def daily_bonus_menu(can_claim: bool) -> InlineKeyboardMarkup:
+    if can_claim:
+        return _kb([
+            [_button("🎲 Бросить кубик", "bonus:roll")],
+            [_button("← Главная", "menu:main")]
+        ])
+    else:
+        return _kb([
+            [_button("⏳ Уже получен", NOOP_CALLBACK)],
+            [_button("← Главная", "menu:main")]
+        ])
+
 # ---------------------------------------------------------------- Общий список заданий
 def combined_tasks_menu(tasks: Sequence[dict], page: int, pages: int) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
@@ -502,4 +515,5 @@ __all__ = [
     "task_detail", "tasks_back", "tasks_list", "traffic_audience", "traffic_cancel",
     "traffic_categories", "traffic_menu", "traffic_orders_menu", "withdraw_cancel",
     "withdrawal_channel_decision", "withdraw_gifts_menu", "withdraw_history_menu",
+    "daily_bonus_menu",
 ]

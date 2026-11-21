@@ -310,6 +310,19 @@ class Database:
             (int(user_id), int(limit)),
         )
 
+    async def get_bonus_cooldown(self, user_id: int) -> int:
+        """Возвращает оставшиеся секунды до следующего кубика."""
+        diff = await self._scalar(
+            "SELECT strftime('%s', 'now') - strftime('%s', created_at) "
+            "FROM transactions WHERE user_id = ? AND kind = 'daily_bonus' "
+            "ORDER BY id DESC LIMIT 1",
+            (int(user_id),)
+        )
+        if diff is None:
+            return 0
+        remaining = 86400 - int(diff)  # 24 часа = 86400 секунд
+        return max(0, remaining)
+
     # ------------------------------------------------------------------ tasks
     async def create_task(
         self,

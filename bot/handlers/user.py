@@ -30,6 +30,7 @@ from bot.keyboards import (
     task_detail,
     tasks_back,
     tasks_list,
+    daily_bonus_menu,  # ДОБАВЛЕНО
 )
 from bot.services import (
     claim_task_reward,
@@ -177,7 +178,7 @@ async def _fetch_botohub(user_id: int, db: Any) -> list[dict]:
             })
         return result
     except Exception as e:
-        logger.error(f"Ошибка BotoHub (пропускаем): {e}") # Изменил на error, чтобы было видно в логах!
+        logger.error(f"Ошибка BotoHub (пропускаем): {e}")
         return []
 
 async def _fetch_flyer(user_id: int, from_user: Any) -> list[dict]:
@@ -196,7 +197,7 @@ async def _fetch_flyer(user_id: int, from_user: Any) -> list[dict]:
             })
         return result
     except Exception as e:
-        logger.error(f"Ошибка Flyer (пропускаем): {e}") # Изменил на error, чтобы было видно в логах!
+        logger.error(f"Ошибка Flyer (пропускаем): {e}")
         return []
 
 async def _get_all_tasks(db: Any, user_id: int, from_user: Any) -> list[dict[str, Any]]:
@@ -323,9 +324,7 @@ async def _required_tasks_text(db: Any) -> int:
     F.data.in_({"menu:main", "menu:tasks", "menu:balance", "menu:referral", "menu:bonus", "menu:profile"})
 )
 async def cb_main_menu(callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any], state: FSMContext) -> None:
-    # СРАЗУ отвечаем на кнопку, чтобы Telegram не выдал ошибку "query is too old"
     await callback.answer()
-
     await state.clear()
     action = (callback.data or "menu:main").split(":")[1]
     fresh = await db.get_user(int(user["id"])) or user
@@ -343,15 +342,63 @@ async def cb_main_menu(callback: CallbackQuery, db: Any, settings: Any, user: di
     elif action == "referral":
         await _show_referral(callback.message, db, settings, fresh)
     elif action == "bonus":
-        tasks, pages = await db.paginate_tasks(int(user["id"]), 1, TASKS_PER_PAGE, bonus=True)
-        available = await db.count_available_tasks(int(user["id"]), bonus=True)
-        if not tasks:
-            await safe_edit(callback.message, await get_text(db, "bonus_empty"), back_to_main())
-        else:
-            text = render(await get_text(db, "bonus"), available=available, tasks_done=int(fresh["tasks_done"]), page=1, pages=pages)
-            await safe_edit(callback.message, text, tasks_list(tasks, 1, pages, "bonus"))
+        await _show_daily_bonus(callback.message, db, fresh)
     elif action == "profile":
         await _show_profile(callback.message, db, settings, fresh)
+
+
+# ------------------------------------------------------------------ ЕЖЕДНЕВНЫЙ БОНУС (КУБИК)
+async def _show_daily_bonus(message: Message, db: Any, user: dict[str, Any]) -> None:
+    cooldown = await db.get_bonus_cooldown(int(user["id"]))
+    can_claim = cooldown <= 0
+
+    if can_claim:
+        status = "✅ Доступен прямо сейчас!"
+        kb = daily_bonus_menu(True)
+    else:
+        hours = cooldown // 3600
+        minutes = (cooldown % 3600) // 60
+        time_str = f"{hours} ч {minutes} мин" if hours > 0 else f"{minutes} мин"
+        status = f"⏳ Следующий бонус через <b>{time_str}</b>"
+        kb = daily_bonus_menu(False)
+
+    template = await get_text(db, "daily_bonus")
+    text = render(template, status=status)
+    await safe_edit(message, text, kb)
+
+
+@router.callback_query(F.data == "bonus:roll")
+async def cb_bonus_roll(callback: CallbackQuery, db: Any, user: dict[str, Any], bot: Bot) -> None:
+    cooldown = await db.get_bonus_cooldown(int(user["id"]))
+    if cooldown > 0:
+        await callback.answer("Бонус еще не восстановился!", show_alert=True)
+        return
+
+    await callback.answer("Бросаем кубик...")
+    if callback.message is None:
+        return
+
+    # Отправляем кубик
+    msg = await bot.send_dice(callback.message.chat.id, emoji="🎲")
+    dice_value = msg.dice.value
+
+    # Начисляем
+    reward_units = dice_value * STARS_SCALE
+    await db.add_balance(int(user["id"]), reward_units, "daily_bonus", f"Кубик: выпало {dice_value}")
+
+    # Ждем, пока пройдет анимация кубика (около 2.5 секунд)
+    await asyncio.sleep(2.5)
+
+    # Обновляем меню
+    fresh = await db.get_user(int(user["id"])) or user
+    await _show_daily_bonus(callback.message, db, fresh)
+
+    # Отправляем сообщение с результатом
+    await bot.send_message(
+        callback.message.chat.id,
+        f"🎉 Тебе выпало <b>{dice_value}</b>! Начислено <b>{dice_value}</b> ⭐.\n"
+        f"Твой баланс: <b>{format_units(int(fresh['balance']))}</b> ⭐"
+    )
 
 
 # ---------------------------------------------------------------------- пагинация заданий
