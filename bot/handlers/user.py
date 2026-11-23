@@ -13,7 +13,7 @@ from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, Message
 
 from bot.bootstrap import promote_first_user
 from bot.defaults import TASK_TYPE_LABELS
@@ -22,6 +22,7 @@ from bot.keyboards import (
     back_to_main,
     balance_menu,
     combined_tasks_menu,
+    daily_bonus_menu,
     history_menu,
     main_menu,
     profile_menu,
@@ -31,20 +32,19 @@ from bot.keyboards import (
     task_detail,
     tasks_back,
     tasks_list,
-    daily_bonus_menu,
 )
 from bot.services import (
+    botohub_client,
     claim_task_reward,
+    darkboost_client,
     evaluate_sponsors,
+    flyer_client,
     get_min_withdraw_units,
     get_ref_settings,
     get_sponsor_channels,
     get_sponsor_gate_text,
     get_text,
     tgrass_client,
-    botohub_client,
-    darkboost_client,
-    flyer_client,
     verify_task,
 )
 from bot.states import PromoStates
@@ -69,7 +69,7 @@ API_TIMEOUT = 15.0
 
 # --- КЭШ ЗАДАНИЙ ---
 API_CACHE: dict[int, tuple[float, list[dict]]] = {}
-CACHE_TTL = 180  # 3 минуты
+CACHE_TTL = 60  # 1 минута — задания должны обновляться быстрее
 
 # --- СЕССИИ DARKBOOST ---
 DARKBOOST_SESSIONS: dict[int, dict[str, Any]] = {}
@@ -163,19 +163,28 @@ async def _fetch_tgrass(user_id: int, from_user: Any, db: Any) -> tuple[list[dic
 
     result = []
     for o in res.get("offers", []):
-        if o.get("subscribed"): continue
-        result.append({
-            "source": "tgrass", "id": str(o.get("offer_id")), "url": o.get("link"),
-            "title": o.get("name") or ("Канал" if o["type"] == "channel" else "Бот"),
-            "type": o.get("type", "channel"), "reward": reward_units, "completed": False, "raw": o
-        })
+        if o.get("subscribed"):
+            continue
+        result.append(
+            {
+                "source": "tgrass",
+                "id": str(o.get("offer_id")),
+                "url": o.get("link"),
+                "title": o.get("name") or ("Канал" if o.get("type") == "channel" else "Бот"),
+                "type": o.get("type", "channel"),
+                "reward": reward_units,
+                "completed": False,
+                "raw": o,
+            }
+        )
     return result, res, "Tgrass"
 
+
 async def _fetch_botohub(user_id: int, db: Any) -> tuple[list[dict], Any, str]:
-    all_tasks = []
+    all_tasks: list[dict] = []
     offset = 0
     limit = 50
-    last_res = {}
+    last_res: dict[str, Any] = {}
     while True:
         res = await botohub_client.get_tasks(user_id, limit=limit, offset=offset)
         last_res = res
@@ -184,66 +193,106 @@ async def _fetch_botohub(user_id: int, db: Any) -> tuple[list[dict], Any, str]:
             break
         reward_units = await db.get_int_setting("botohub_reward_units", 10000)
         for t in tasks:
-            if t.get("completed"): continue
-            all_tasks.append({
-                "source": "botohub", "id": str(t.get("resource_id") or t.get("url")), "url": t["url"],
-                "title": "Спонсор BotoHub", "type": "channel", "reward": reward_units, "completed": False, "raw": t
-            })
+            if t.get("completed"):
+                continue
+            all_tasks.append(
+                {
+                    "source": "botohub",
+                    "id": str(t.get("resource_id") or t.get("url")),
+                    "url": t["url"],
+                    "title": t.get("title") or t.get("name") or "Спонсор BotoHub",
+                    "type": "channel",
+                    "reward": reward_units,
+                    "completed": False,
+                    "raw": t,
+                }
+            )
         if len(tasks) < limit:
             break
         offset += limit
         await asyncio.sleep(0.2)
     return all_tasks, last_res, "BotoHub"
 
+
 async def _fetch_darkboost(user_id: int, db: Any) -> tuple[list[dict], Any, str]:
     try:
-        # Увеличили лимит до 10 (максимум по API)
         res = await darkboost_client.get_sponsors(user_id, user_id, max_sponsors=10)
         sponsors = res.get("sponsors", [])
         session_id = res.get("session_id")
 
         reward_units = await db.get_int_setting("darkboost_reward_units", 20000)
 
-        if sponsors and session_id:
+        # Не перезаписываем активную сессию: если она уже есть,
+        # значит пользователь ещё не нажал «Проверить» и не получил выплату.
+        if sponsors and session_id and user_id not in DARKBOOST_SESSIONS:
             DARKBOOST_SESSIONS[user_id] = {
                 "session_id": session_id,
-                "count": len(sponsors)
+                "count": len(sponsors),
             }
+            logger.info(
+                "DarkBoost: открыта сессия user=%s session=%s sponsors=%s",
+                user_id, session_id, len(sponsors),
+            )
 
         result = []
         for s in sponsors:
-            result.append({
-                "source": "darkboost", "id": str(s.get("id")), "url": s.get("link"),
-                "title": s.get("name") or "Спонсор DarkBoost", "type": "channel", "reward": reward_units, "completed": False, "raw": s
-            })
+            result.append(
+                {
+                    "source": "darkboost",
+                    "id": str(s.get("id")),
+                    "url": s.get("link"),
+                    "title": s.get("name") or "Спонсор DarkBoost",
+                    "type": "channel",
+                    "reward": reward_units,
+                    "completed": False,
+                    "raw": s,
+                }
+            )
         return result, res, "DarkBoost"
     except Exception as e:
-        logger.error(f"Ошибка DarkBoost: {e}")
-        raise e
+        logger.exception("Ошибка DarkBoost: %s", e)
+        raise
+
 
 async def _fetch_flyer(user_id: int, from_user: Any, db: Any) -> tuple[list[dict], Any, str]:
     return [], {"error": "Flyer API domain is dead"}, "Flyer"
 
 
-async def _get_all_tasks(db: Any, user_id: int, from_user: Any, settings: Any, bot: Bot) -> list[dict[str, Any]]:
-    tasks = []
-    errors = []
-    debug_reports = []
+async def _get_all_tasks(
+    db: Any, user_id: int, from_user: Any, settings: Any, bot: Bot
+) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    errors: list[str] = []
+    debug_reports: list[str] = []
 
-    # 1. Задания из БД
+    # 1. Задания из БД — всегда свежие, кэш к ним не применяется
     db_tasks, _ = await db.paginate_tasks(user_id, 1, 1000)
     for t in db_tasks:
-        if t["is_completed"]: continue
-        tasks.append({
-            "source": "db", "id": str(t["id"]), "url": t["url"], "title": t["title"],
-            "type": t["type"], "reward": int(t["reward"]), "completed": False, "raw": t
-        })
+        if t["is_completed"]:
+            continue
+        tasks.append(
+            {
+                "source": "db",
+                "id": str(t["id"]),
+                "url": t["url"],
+                "title": t["title"],
+                "type": t["type"],
+                "reward": int(t["reward"]),
+                "completed": False,
+                "raw": t,
+            }
+        )
 
-    # 2. Кэш
+    # 2. Кэш API-заданий
     now = time.time()
-    if int(user_id) in API_CACHE:
-        cached_time, cached_tasks = API_CACHE[int(user_id)]
+    cached = API_CACHE.get(int(user_id))
+    if cached is not None:
+        cached_time, cached_tasks = cached
         if now - cached_time < CACHE_TTL:
+            logger.debug(
+                "Задания: отдаю API из кэша user=%s age=%.1fs count=%s",
+                user_id, now - cached_time, len(cached_tasks),
+            )
             tasks.extend(cached_tasks)
             return tasks
 
@@ -255,11 +304,11 @@ async def _get_all_tasks(db: Any, user_id: int, from_user: Any, settings: Any, b
                 _fetch_botohub(user_id, db),
                 _fetch_darkboost(user_id, db),
                 _fetch_flyer(user_id, from_user, db),
-                return_exceptions=True
+                return_exceptions=True,
             ),
-            timeout=API_TIMEOUT
+            timeout=API_TIMEOUT,
         )
-        api_tasks = []
+        api_tasks: list[dict] = []
         for res in results:
             if isinstance(res, Exception):
                 errors.append(str(res))
@@ -269,13 +318,26 @@ async def _get_all_tasks(db: Any, user_id: int, from_user: Any, settings: Any, b
                 if not fetched_tasks:
                     debug_reports.append(f"<b>{api_name}</b> вернул пусто.")
 
-        API_CACHE[int(user_id)] = (now, api_tasks)
+        # Пустые ответы не кэшируем — иначе «нет заданий» залипает на CACHE_TTL
+        if api_tasks:
+            API_CACHE[int(user_id)] = (now, api_tasks)
+            logger.info(
+                "Задания: API обновлён user=%s count=%s errors=%s",
+                user_id, len(api_tasks), len(errors),
+            )
+        else:
+            API_CACHE.pop(int(user_id), None)
+            logger.info(
+                "Задания: API вернул пусто user=%s errors=%s",
+                user_id, len(errors),
+            )
         tasks.extend(api_tasks)
 
     except asyncio.TimeoutError:
         errors.append(f"Превышено время ожидания ({API_TIMEOUT} сек)")
+        logger.warning("Задания: таймаут API user=%s", user_id)
 
-    # 4. Диагностика
+    # 4. Диагностика админу
     if not tasks and int(user_id) in getattr(settings, "admin_ids", frozenset()):
         msg = "🛠 <b>Диагностика заданий</b>\n\n"
         if errors:
@@ -284,12 +346,23 @@ async def _get_all_tasks(db: Any, user_id: int, from_user: Any, settings: Any, b
             msg += "ℹ️ <b>Ответы API:</b>\n" + "\n\n".join(debug_reports) + "\n\n"
         if not errors and not debug_reports:
             msg += "Нет заданий."
-        await bot.send_message(user_id, msg)
+        try:
+            await bot.send_message(user_id, msg)
+        except (TelegramForbiddenError, TelegramBadRequest):
+            pass
 
     return tasks
 
 
-async def _show_tasks_page(message: Message, db: Any, settings: Any, user: dict[str, Any], from_user: Any, bot: Bot, page: int = 1) -> None:
+async def _show_tasks_page(
+    message: Message,
+    db: Any,
+    settings: Any,
+    user: dict[str, Any],
+    from_user: Any,
+    bot: Bot,
+    page: int = 1,
+) -> None:
     all_tasks = await _get_all_tasks(db, int(user["id"]), from_user, settings, bot)
 
     if not all_tasks:
@@ -377,9 +450,25 @@ async def _required_tasks_text(db: Any) -> int:
 
 # ------------------------------------------------------------------ меню/разделы
 @router.callback_query(
-    F.data.in_({"menu:main", "menu:tasks", "menu:balance", "menu:referral", "menu:bonus", "menu:profile"})
+    F.data.in_(
+        {
+            "menu:main",
+            "menu:tasks",
+            "menu:balance",
+            "menu:referral",
+            "menu:bonus",
+            "menu:profile",
+        }
+    )
 )
-async def cb_main_menu(callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any], state: FSMContext, bot: Bot) -> None:
+async def cb_main_menu(
+    callback: CallbackQuery,
+    db: Any,
+    settings: Any,
+    user: dict[str, Any],
+    state: FSMContext,
+    bot: Bot,
+) -> None:
     await callback.answer()
     await state.clear()
     action = (callback.data or "menu:main").split(":")[1]
@@ -390,15 +479,16 @@ async def cb_main_menu(callback: CallbackQuery, db: Any, settings: Any, user: di
 
     if action == "tasks":
         is_cached = False
-        if int(fresh["id"]) in API_CACHE:
-            cached_time, _ = API_CACHE[int(fresh["id"])]
-            if time.time() - cached_time < CACHE_TTL:
-                is_cached = True
+        cached = API_CACHE.get(int(fresh["id"]))
+        if cached is not None and time.time() - cached[0] < CACHE_TTL:
+            is_cached = True
 
         if not is_cached:
             await safe_edit(callback.message, "⏳ <i>Загружаем список заданий...</i>")
 
-        await _show_tasks_page(callback.message, db, settings, fresh, callback.from_user, bot, page=1)
+        await _show_tasks_page(
+            callback.message, db, settings, fresh, callback.from_user, bot, page=1
+        )
     elif action == "main":
         await _show_main_menu(callback.message, db, settings, fresh)
     elif action == "balance":
@@ -413,18 +503,21 @@ async def cb_main_menu(callback: CallbackQuery, db: Any, settings: Any, user: di
 
 # ------------------------------------------------------------------ КНОПКА ОБНОВИТЬ (СБРОС КЭША)
 @router.callback_query(F.data == "tasks:refresh")
-async def cb_tasks_refresh(callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any], bot: Bot) -> None:
+async def cb_tasks_refresh(
+    callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any], bot: Bot
+) -> None:
     await callback.answer("Обновляем...")
     if callback.message is None:
         return
 
     # Принудительно чистим кэш
-    if int(user["id"]) in API_CACHE:
-        del API_CACHE[int(user["id"])]
+    API_CACHE.pop(int(user["id"]), None)
 
     await safe_edit(callback.message, "⏳ <i>Ищем новые задания...</i>")
     fresh = await db.get_user(int(user["id"])) or user
-    await _show_tasks_page(callback.message, db, settings, fresh, callback.from_user, bot, page=1)
+    await _show_tasks_page(
+        callback.message, db, settings, fresh, callback.from_user, bot, page=1
+    )
 
 
 # ------------------------------------------------------------------ ЕЖЕДНЕВНЫЙ БОНУС (КУБИК)
@@ -448,7 +541,9 @@ async def _show_daily_bonus(message: Message, db: Any, user: dict[str, Any]) -> 
 
 
 @router.callback_query(F.data == "bonus:roll")
-async def cb_bonus_roll(callback: CallbackQuery, db: Any, user: dict[str, Any], bot: Bot) -> None:
+async def cb_bonus_roll(
+    callback: CallbackQuery, db: Any, user: dict[str, Any], bot: Bot
+) -> None:
     cooldown = await db.get_bonus_cooldown(int(user["id"]))
     if cooldown > 0:
         await callback.answer("Бонус еще не восстановился!", show_alert=True)
@@ -462,7 +557,9 @@ async def cb_bonus_roll(callback: CallbackQuery, db: Any, user: dict[str, Any], 
     dice_value = msg.dice.value
 
     reward_units = dice_value * STARS_SCALE
-    await db.add_balance(int(user["id"]), reward_units, "daily_bonus", f"Кубик: выпало {dice_value}")
+    await db.add_balance(
+        int(user["id"]), reward_units, "daily_bonus", f"Кубик: выпало {dice_value}"
+    )
 
     await asyncio.sleep(2.5)
 
@@ -472,62 +569,94 @@ async def cb_bonus_roll(callback: CallbackQuery, db: Any, user: dict[str, Any], 
     await bot.send_message(
         callback.message.chat.id,
         f"🎉 Тебе выпало <b>{dice_value}</b>! Начислено <b>{dice_value}</b> ⭐.\n"
-        f"Твой баланс: <b>{format_units(int(fresh['balance']))}</b> ⭐"
+        f"Твой баланс: <b>{format_units(int(fresh['balance']))}</b> ⭐",
     )
 
 
 # ---------------------------------------------------------------------- пагинация заданий
 @router.callback_query(F.data.startswith("tasks:page:"))
-async def cb_tasks_page(callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any], bot: Bot) -> None:
+async def cb_tasks_page(
+    callback: CallbackQuery,
+    db: Any,
+    settings: Any,
+    user: dict[str, Any],
+    bot: Bot,
+) -> None:
+    """Пагинация и возврат в список заданий / бонусов.
+
+    Поддерживаемые форматы callback_data:
+        tasks:page:<N>            — обычный список заданий (старый формат)
+        tasks:page:tasks:<N>      — обычный список заданий (из tasks_back/task_detail)
+        tasks:page:bonus:<N>      — список бонусных заданий
+    """
     await callback.answer()
     parts = _parse_callback(callback.data or "", 3, 4)
     if parts is None or callback.message is None:
         return
 
-    if len(parts) == 3:
-        try:
-            page = int(parts[2])
-        except ValueError:
-            page = 1
-
-        fresh = await db.get_user(int(user["id"])) or user
-        await _show_tasks_page(callback.message, db, settings, fresh, callback.from_user, bot, page=page)
+    origin = "tasks"
+    if len(parts) == 4:
+        origin = parts[2]
+        raw_page = parts[3]
     else:
-        origin, raw_page = parts[2], parts[3]
-        if origin != "bonus":
-            return
-        try:
-            page = int(raw_page)
-        except ValueError:
-            page = 1
-        tasks, pages = await db.paginate_tasks(int(user["id"]), page, TASKS_PER_PAGE, bonus=True)
-        fresh = await db.get_user(int(user["id"])) or user
+        raw_page = parts[2]
+
+    try:
+        page = int(raw_page)
+    except ValueError:
+        page = 1
+
+    fresh = await db.get_user(int(user["id"])) or user
+
+    if origin == "bonus":
+        tasks, pages = await db.paginate_tasks(
+            int(user["id"]), page, TASKS_PER_PAGE, bonus=True
+        )
         if not tasks:
-            await safe_edit(callback.message, await get_text(db, "bonus_empty"), back_to_main())
+            await safe_edit(
+                callback.message, await get_text(db, "bonus_empty"), back_to_main()
+            )
         else:
-            text = render(await get_text(db, "bonus"), available=await db.count_available_tasks(int(user["id"]), bonus=True), tasks_done=int(fresh["tasks_done"]), page=page, pages=pages)
+            text = render(
+                await get_text(db, "bonus"),
+                available=await db.count_available_tasks(int(user["id"]), bonus=True),
+                tasks_done=int(fresh["tasks_done"]),
+                page=page,
+                pages=pages,
+            )
             await safe_edit(callback.message, text, tasks_list(tasks, page, pages, "bonus"))
+        return
+
+    # origin == "tasks" (и старый формат из 3 частей) — общий список
+    await _show_tasks_page(
+        callback.message, db, settings, fresh, callback.from_user, bot, page=page
+    )
 
 
+# ---------------------------------------------------------------------- общая кнопка «Проверить»
 @router.callback_query(F.data == "tasks:check")
-async def cb_tasks_check(callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any], bot: Bot) -> None:
+async def cb_tasks_check(
+    callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any], bot: Bot
+) -> None:
     await callback.answer("Проверяем...")
     if callback.message is None:
         return
 
     await safe_edit(callback.message, "⏳ <i>Проверяем выполнение заданий...</i>")
 
-    if int(user["id"]) in API_CACHE:
-        del API_CACHE[int(user["id"])]
+    # Сбрасываем кэш, чтобы после проверки показать актуальный список
+    API_CACHE.pop(int(user["id"]), None)
 
     await asyncio.gather(
         _process_tgrass_payments(db, int(user["id"]), callback.from_user),
         _process_botohub_payments(db, int(user["id"])),
-        _process_darkboost_payments(db, int(user["id"]))
+        _process_darkboost_payments(db, int(user["id"])),
     )
 
     fresh = await db.get_user(int(user["id"])) or user
-    await _show_tasks_page(callback.message, db, settings, fresh, callback.from_user, bot, page=1)
+    await _show_tasks_page(
+        callback.message, db, settings, fresh, callback.from_user, bot, page=1
+    )
 
 
 # ---------------------------------------------------------------------- задания из БД
@@ -540,6 +669,8 @@ async def cb_task_open(callback: CallbackQuery, db: Any, user: dict[str, Any]) -
         task_id = int(parts[2])
     except ValueError:
         return
+    origin = parts[3] if len(parts) > 3 else "tasks"
+
     task = await db.get_task(task_id)
     if task is None or not task.get("is_active"):
         await callback.answer("Задание больше недоступно", show_alert=True)
@@ -549,19 +680,23 @@ async def cb_task_open(callback: CallbackQuery, db: Any, user: dict[str, Any]) -
     await safe_edit(
         callback.message,
         _task_card_text(task, completed),
-        task_detail(task_id, "tasks", completed),
+        task_detail(task_id, origin, completed),
     )
 
 
 @router.callback_query(F.data.startswith("task:check:"))
-async def cb_task_check(callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any], bot: Bot) -> None:
+async def cb_task_check(
+    callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any], bot: Bot
+) -> None:
     parts = _parse_callback(callback.data or "", 4, 4)
-    if parts is None:
+    if parts is None or callback.message is None:
         return
     try:
         task_id = int(parts[2])
     except ValueError:
         return
+    origin = parts[3] if len(parts) > 3 else "tasks"
+
     task = await db.get_task(task_id)
     if task is None or not task.get("is_active"):
         await callback.answer("Задание больше недоступно", show_alert=True)
@@ -573,13 +708,18 @@ async def cb_task_check(callback: CallbackQuery, db: Any, settings: Any, user: d
     await callback.answer("Проверяем...")
     verified = await verify_task(bot, int(user["id"]), task)
     if not verified:
-        await callback.answer("Условия не выполнены. Подпишись и попробуй снова.", show_alert=True)
+        await callback.answer(
+            "Условия не выполнены. Подпишись и попробуй снова.", show_alert=True
+        )
         return
 
     result = await claim_task_reward(db, int(user["id"]), task)
     if not result.get("completed"):
         await callback.answer("Ты уже выполнил это задание ✅", show_alert=True)
         return
+
+    # Список заданий изменился — сбрасываем кэш, чтобы «← К заданиям» показал актуальное
+    API_CACHE.pop(int(user["id"]), None)
 
     reward = int(result["reward"])
     payout = result.get("payout")
@@ -592,7 +732,19 @@ async def cb_task_check(callback: CallbackQuery, db: Any, settings: Any, user: d
         f"💰 Начислено: <b>{format_units(reward)}</b> ⭐\n"
         f"⭐ Баланс: <b>{format_units(int(fresh['balance']))}</b> ⭐"
     )
-    await safe_edit(callback.message, success, tasks_back("tasks"))
+    await safe_edit(callback.message, success, tasks_back(origin))
+
+
+@router.callback_query(F.data == "task:done")
+async def cb_task_done(callback: CallbackQuery) -> None:
+    """Кнопка «✅ Уже выполнено» в карточке задания — раньше была без хендлера."""
+    await callback.answer("Задание уже выполнено ✅", show_alert=True)
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery) -> None:
+    """Кнопки-разделители пагинации («· 1/1 ·») и пробелы."""
+    await callback.answer()
 
 
 # ------------------------------------------------------------------------ баланс
@@ -623,13 +775,18 @@ async def cb_balance_history(callback: CallbackQuery, db: Any, user: dict[str, A
             amount = int(item["amount"])
             sign = "+" if amount > 0 else "−"
             label = TRANSACTION_KIND_LABELS.get(str(item["kind"]), "Операция")
-            lines.append(f"{label} · <b>{sign}{format_units(abs(amount))}</b> ⭐ · {format_dt(str(item.get('created_at') or ''))}")
+            lines.append(
+                f"{label} · <b>{sign}{format_units(abs(amount))}</b> ⭐ · "
+                f"{format_dt(str(item.get('created_at') or ''))}"
+            )
     await callback.answer()
     await safe_edit(callback.message, "\n".join(lines), history_menu())
 
 
 # ---------------------------------------------------------------------- рефералы
-async def _show_referral(message: Message, db: Any, settings: Any, user: dict[str, Any]) -> None:
+async def _show_referral(
+    message: Message, db: Any, settings: Any, user: dict[str, Any]
+) -> None:
     stats = await db.get_referral_stats(int(user["id"]))
     ref_settings = await get_ref_settings(db)
     username = getattr(settings, "bot_username", "") or "bot"
@@ -644,12 +801,14 @@ async def _show_referral(message: Message, db: Any, settings: Any, user: dict[st
         percent=ref_settings["percent"],
         link=html.escape(ref_link),
     )
-    share_text = f"Зарабатывай Stars за простые задания!"
+    share_text = "Зарабатывай Stars за простые задания!"
     await safe_edit(message, text, referral_menu(ref_link, share_text))
 
 
 # ------------------------------------------------------------------------ профиль
-async def _show_profile(message: Message, db: Any, settings: Any, user: dict[str, Any]) -> None:
+async def _show_profile(
+    message: Message, db: Any, settings: Any, user: dict[str, Any]
+) -> None:
     language = str(user.get("language") or "ru")
     notifications = bool(user.get("notifications", 1))
     template = await get_text(db, "profile")
@@ -664,7 +823,9 @@ async def _show_profile(message: Message, db: Any, settings: Any, user: dict[str
 
 
 @router.callback_query(F.data.startswith("profile:lang:"))
-async def cb_profile_language(callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any]) -> None:
+async def cb_profile_language(
+    callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any]
+) -> None:
     try:
         language = (callback.data or "").split(":")[2]
     except IndexError:
@@ -679,7 +840,9 @@ async def cb_profile_language(callback: CallbackQuery, db: Any, settings: Any, u
 
 
 @router.callback_query(F.data == "profile:notifications")
-async def cb_profile_notifications(callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any]) -> None:
+async def cb_profile_notifications(
+    callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any]
+) -> None:
     enabled = not bool(user.get("notifications", 1))
     await db.set_notifications(int(user["id"]), enabled)
     fresh = await db.get_user(int(user["id"])) or user
@@ -693,11 +856,19 @@ async def cb_profile_promo(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PromoStates.waiting_code)
     await callback.answer()
     if callback.message is not None:
-        await callback.message.answer("🎟 Отправь промокод. Для отмены — /cancel.", reply_markup=promo_cancel())
+        await callback.message.answer(
+            "🎟 Отправь промокод. Для отмены — /cancel.", reply_markup=promo_cancel()
+        )
 
 
 @router.callback_query(F.data == "profile:cancel")
-async def cb_profile_cancel(callback: CallbackQuery, db: Any, settings: Any, user: dict[str, Any], state: FSMContext) -> None:
+async def cb_profile_cancel(
+    callback: CallbackQuery,
+    db: Any,
+    settings: Any,
+    user: dict[str, Any],
+    state: FSMContext,
+) -> None:
     await state.clear()
     fresh = await db.get_user(int(user["id"])) or user
     await callback.answer("Отменено")
@@ -715,7 +886,9 @@ async def cb_profile_partner(callback: CallbackQuery, db: Any) -> None:
 
 
 @router.message(PromoStates.waiting_code)
-async def promo_code(message: Message, state: FSMContext, db: Any, settings: Any, user: dict[str, Any]) -> None:
+async def promo_code(
+    message: Message, state: FSMContext, db: Any, settings: Any, user: dict[str, Any]
+) -> None:
     code = (message.text or "").strip()
     if not code:
         await message.answer("Отправь промокод текстом.")
@@ -736,25 +909,33 @@ async def promo_code(message: Message, state: FSMContext, db: Any, settings: Any
 async def _process_tgrass_payments(db: Any, user_id: int, from_user: Any) -> None:
     try:
         res = await tgrass_client.get_offers(
-            user_id=user_id, lang=from_user.language_code or "ru",
-            is_premium=from_user.is_premium or False, username=from_user.username
+            user_id=user_id,
+            lang=from_user.language_code or "ru",
+            is_premium=from_user.is_premium or False,
+            username=from_user.username,
         )
         ref = await get_ref_settings(db)
         reward_units = await db.get_int_setting("tgrass_reward_units", 20000)
 
         for offer in res.get("offers", []):
-            if not offer.get("subscribed"): continue
+            if not offer.get("subscribed"):
+                continue
             offer_id = offer.get("offer_id")
-            if offer_id is None: continue
+            if offer_id is None:
+                continue
 
             success = await db.complete_tgrass_offer(user_id, int(offer_id), reward_units)
             if success:
+                logger.info("Tgrass: начислено user=%s offer=%s", user_id, offer_id)
                 await db.apply_referral_rewards(
-                    user_id, reward_units,
-                    required_tasks=ref["required_tasks"], bonus=ref["bonus_units"], percent=ref["percent"]
+                    user_id,
+                    reward_units,
+                    required_tasks=ref["required_tasks"],
+                    bonus=ref["bonus_units"],
+                    percent=ref["percent"],
                 )
     except Exception:
-        pass
+        logger.exception("Tgrass: ошибка при обработке платежей user=%s", user_id)
 
 
 async def _process_botohub_payments(db: Any, user_id: int) -> None:
@@ -764,24 +945,31 @@ async def _process_botohub_payments(db: Any, user_id: int) -> None:
         ref = await get_ref_settings(db)
 
         for task in res.get("tasks", []):
-            if not task.get("completed"): continue
+            if not task.get("completed"):
+                continue
             resource_id = task.get("resource_id") or task.get("url")
-            if not resource_id: continue
+            if not resource_id:
+                continue
 
             success = await db.complete_botohub_task(user_id, str(resource_id), reward_units)
             if success:
+                logger.info("BotoHub: начислено user=%s resource=%s", user_id, resource_id)
                 await db.apply_referral_rewards(
-                    user_id, reward_units,
-                    required_tasks=ref["required_tasks"], bonus=ref["bonus_units"], percent=ref["percent"]
+                    user_id,
+                    reward_units,
+                    required_tasks=ref["required_tasks"],
+                    bonus=ref["bonus_units"],
+                    percent=ref["percent"],
                 )
     except Exception:
-        pass
+        logger.exception("BotoHub: ошибка при обработке платежей user=%s", user_id)
 
 
 async def _process_darkboost_payments(db: Any, user_id: int) -> None:
     try:
         session_data = DARKBOOST_SESSIONS.get(user_id)
         if not session_data:
+            logger.debug("DarkBoost: нет активной сессии user=%s", user_id)
             return
 
         res = await darkboost_client.check(user_id, session_data["session_id"])
@@ -789,14 +977,30 @@ async def _process_darkboost_payments(db: Any, user_id: int) -> None:
             reward_units = await db.get_int_setting("darkboost_reward_units", 20000)
             total_reward = reward_units * session_data["count"]
 
-            await db.add_balance(user_id, total_reward, "task", f"DarkBoost: {session_data['count']} спонсоров")
+            await db.add_balance(
+                user_id,
+                total_reward,
+                "task",
+                f"DarkBoost: {session_data['count']} спонсоров",
+            )
+            logger.info(
+                "DarkBoost: начислено user=%s reward=%s sponsors=%s",
+                user_id, total_reward, session_data["count"],
+            )
 
             ref = await get_ref_settings(db)
             await db.apply_referral_rewards(
-                user_id, total_reward,
-                required_tasks=ref["required_tasks"], bonus=ref["bonus_units"], percent=ref["percent"]
+                user_id,
+                total_reward,
+                required_tasks=ref["required_tasks"],
+                bonus=ref["bonus_units"],
+                percent=ref["percent"],
             )
 
-            del DARKBOOST_SESSIONS[user_id]
+            DARKBOOST_SESSIONS.pop(user_id, None)
+        else:
+            logger.info(
+                "DarkBoost: статус не ok user=%s res=%s", user_id, res,
+            )
     except Exception as e:
-        logger.error(f"Ошибка при проверке DarkBoost: {e}")
+        logger.exception("DarkBoost: ошибка при проверке сессии user=%s: %s", user_id, e)
