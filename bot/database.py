@@ -81,6 +81,15 @@ CREATE TABLE IF NOT EXISTS flyer_completions (
     UNIQUE (user_id, signature)
 );
 
+CREATE TABLE IF NOT EXISTS piarflow_completions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    link TEXT NOT NULL,
+    reward INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (user_id, link)
+);
+
 CREATE TABLE IF NOT EXISTS withdrawals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -288,7 +297,7 @@ class Database:
     async def add_balance(
         self, user_id: int, amount: int, kind: str, comment: str | None = None
     ) -> int:
-        """Начисляет/списываетStars и пишет запись в историю операций."""
+        """Начисляет/списывает Stars и пишет запись в историю операций."""
         amount = int(amount)
         async with self._write_lock:
             await self.conn.execute(
@@ -469,7 +478,9 @@ class Database:
         )
 
     # -------------------------------------------------------------- withdrawals
-    async def create_withdrawal(self, user_id: int, amount: int, gift: str = "Подарок") -> int | None:
+    async def create_withdrawal(
+        self, user_id: int, amount: int, gift: str = "Подарок"
+    ) -> int | None:
         amount = int(amount)
         if amount <= 0:
             return None
@@ -1027,3 +1038,40 @@ class Database:
             except Exception:
                 await self.conn.rollback()
                 raise
+
+    # -------------------------------------------------------------- piarflow
+    async def complete_piarflow_offer(self, user_id: int, link: str, reward: int) -> bool:
+        """Начисляет награду за задание PiarFlow ровно один раз."""
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await self.conn.execute(
+                    "INSERT OR IGNORE INTO piarflow_completions (user_id, link, reward) "
+                    "VALUES (?, ?, ?)",
+                    (int(user_id), str(link), int(reward)),
+                )
+                if cursor.rowcount == 0:
+                    await self.conn.rollback()
+                    return False
+                await self.conn.execute(
+                    "UPDATE users SET balance = balance + ?, tasks_done = tasks_done + 1, "
+                    "updated_at = datetime('now') WHERE id = ?",
+                    (int(reward), int(user_id)),
+                )
+                await self.conn.execute(
+                    "INSERT INTO transactions (user_id, amount, kind, comment) "
+                    "VALUES (?, ?, 'task', ?)",
+                    (int(user_id), int(reward), f"PiarFlow: {link}"),
+                )
+                await self.conn.commit()
+                return True
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def get_piarflow_completed_links(self, user_id: int) -> set[str]:
+        rows = await self._fetchall(
+            "SELECT link FROM piarflow_completions WHERE user_id = ?",
+            (int(user_id),),
+        )
+        return {str(r["link"]) for r in rows}

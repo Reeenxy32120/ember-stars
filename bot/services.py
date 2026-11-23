@@ -13,7 +13,12 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 from bot.config import load_settings
 from bot.database import Database
-from bot.defaults import DEFAULT_SETTINGS, DEFAULT_TEXTS, STAR_UNIT_SETTINGS, TASK_TYPE_LABELS
+from bot.defaults import (
+    DEFAULT_SETTINGS,
+    DEFAULT_TEXTS,
+    STAR_UNIT_SETTINGS,
+    TASK_TYPE_LABELS,
+)
 from bot.utils import (
     STARS_SCALE,
     escape,
@@ -95,6 +100,7 @@ class TgrassClient:
             logger.error("Tgrass API /check ошибка: %s", exc)
             raise
 
+
 # ------------------------------------------------------------------- BOTOHUB
 class BotohubClient:
     """Клиент для работы с API BotoHub."""
@@ -107,7 +113,9 @@ class BotohubClient:
             "Content-Type": "application/json",
         }
 
-    async def get_tasks(self, chat_id: int, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    async def get_tasks(
+        self, chat_id: int, limit: int = 50, offset: int = 0
+    ) -> dict[str, Any]:
         payload = {
             "chat_id": int(chat_id),
             "limit": int(limit),
@@ -128,6 +136,7 @@ class BotohubClient:
             logger.error("BotoHub API ошибка: %s", exc)
             raise
 
+
 # ------------------------------------------------------------------- DARKBOOST
 class DarkBoostClient:
     """Клиент для работы с API DarkBoost."""
@@ -140,7 +149,9 @@ class DarkBoostClient:
             "Content-Type": "application/json",
         }
 
-    async def get_sponsors(self, user_id: int, chat_id: int, max_sponsors: int = 5) -> dict[str, Any]:
+    async def get_sponsors(
+        self, user_id: int, chat_id: int, max_sponsors: int = 5
+    ) -> dict[str, Any]:
         payload = {
             "user_id": int(user_id),
             "chat_id": int(chat_id),
@@ -179,15 +190,76 @@ class DarkBoostClient:
             logger.error("DarkBoost API /check ошибка: %s", exc)
             raise
 
+
+# ------------------------------------------------------------------- PIARFLOW
+class PiarflowClient:
+    """Клиент для работы с API PiarFlow (https://piarflow.com/v1)."""
+
+    def __init__(self, api_key: str, base_url: str = "https://piarflow.com/v1") -> None:
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    async def get_sponsors(
+        self, user_id: int, chat_id: int, max_sponsors: int = 10
+    ) -> dict[str, Any]:
+        payload = {
+            "user_id": int(user_id),
+            "chat_id": int(chat_id),
+            "max_sponsors": int(max_sponsors),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/sponsors",
+                    json=payload,
+                    headers=self.headers,
+                )
+                response.raise_for_status()
+                data = response.json()
+                logger.info("PiarFlow API /sponsors ответ: %s", data)
+                return data
+        except httpx.HTTPError as exc:
+            logger.error("PiarFlow API /sponsors ошибка: %s", exc)
+            raise
+
+    async def check(self, user_id: int, links: list[str]) -> dict[str, Any]:
+        payload = {
+            "user_id": int(user_id),
+            "links": [str(link) for link in links],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/sponsors/check",
+                    json=payload,
+                    headers=self.headers,
+                )
+                response.raise_for_status()
+                data = response.json()
+                logger.info("PiarFlow API /sponsors/check ответ: %s", data)
+                return data
+        except httpx.HTTPError as exc:
+            logger.error("PiarFlow API /sponsors/check ошибка: %s", exc)
+            raise
+
+
 # ------------------------------------------------------------------- FLYER (Временно отключен)
 class FlyerClient:
     """Клиент для работы с API Flyer."""
 
-    def __init__(self, api_key: str, base_url: str = "https://api.flyerservice.io") -> None:
+    def __init__(
+        self, api_key: str, base_url: str = "https://api.flyerservice.io"
+    ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
 
-    async def get_tasks(self, user_id: int, language_code: str = "ru", limit: int = 50) -> dict[str, Any]:
+    async def get_tasks(
+        self, user_id: int, language_code: str = "ru", limit: int = 50
+    ) -> dict[str, Any]:
         payload = {
             "key": self.api_key,
             "user_id": int(user_id),
@@ -215,7 +287,11 @@ tgrass_client = TgrassClient(
     base_url=_settings.tgrass_api_url,
 )
 botohub_client = BotohubClient(_settings.botohub_api_token)
-darkboost_client = DarkBoostClient(_settings.darkboost_api_key) # <--- ДОБАВЛЕНО
+darkboost_client = DarkBoostClient(_settings.darkboost_api_key)
+piarflow_client = PiarflowClient(
+    api_key=_settings.piarflow_api_key,
+    base_url=_settings.piarflow_api_url,
+)
 flyer_client = FlyerClient(_settings.flyer_api_key)
 
 
@@ -413,7 +489,9 @@ def task_type_label(task: dict[str, Any]) -> str:
     return TASK_TYPE_LABELS.get(str(task.get("type")), str(task.get("type")))
 
 
-async def claim_task_reward(db: Database, user_id: int, task: dict[str, Any]) -> dict[str, Any]:
+async def claim_task_reward(
+    db: Database, user_id: int, task: dict[str, Any]
+) -> dict[str, Any]:
     """Начисляет награду и реферальные бонусы. ``completed=False`` — уже было."""
     reward = int(task["reward"])
     completed = await db.complete_task(user_id, int(task["id"]), reward)

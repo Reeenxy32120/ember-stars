@@ -121,10 +121,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "price_view_units": "345",
     "price_show_units": "860",
     "sponsor_channels": "",
-    "botohub_reward_units": "10000",  # 1 ⭐
-    "tgrass_reward_units": "20000",   # 2 ⭐
-    "flyer_reward_units": "20000",    # 2 ⭐
-    "darkboost_reward_units": "20000", # <--- 2 ⭐ за каждого спонсора DarkBoost
+    "botohub_reward_units": "10000",    # 1 ⭐
+    "tgrass_reward_units": "20000",     # 2 ⭐
+    "flyer_reward_units": "20000",      # 2 ⭐
+    "darkboost_reward_units": "20000",  # 2 ⭐ за каждого спонсора DarkBoost
+    "piarflow_reward_units": "20000",   # 2 ⭐ за задание PiarFlow
     "partner_channel_url": "",
 }
 
@@ -141,7 +142,8 @@ SETTINGS_TITLES: dict[str, str] = {
     "botohub_reward_units": "Награда за задание BotoHub",
     "tgrass_reward_units": "Награда за задание Tgrass",
     "flyer_reward_units": "Награда за задание Flyer",
-    "darkboost_reward_units": "Награда за 1 спонсора DarkBoost", # <--- ДОБАВЛЕНО
+    "darkboost_reward_units": "Награда за 1 спонсора DarkBoost",
+    "piarflow_reward_units": "Награда за задание PiarFlow",
 }
 
 STAR_UNIT_SETTINGS: frozenset[str] = frozenset(
@@ -156,6 +158,7 @@ STAR_UNIT_SETTINGS: frozenset[str] = frozenset(
         "tgrass_reward_units",
         "flyer_reward_units",
         "darkboost_reward_units",
+        "piarflow_reward_units",
     }
 )
 

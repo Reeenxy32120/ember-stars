@@ -6,6 +6,7 @@ import asyncio
 import html
 import logging
 import math
+import re
 import time
 from typing import Any
 
@@ -44,6 +45,7 @@ from bot.services import (
     get_sponsor_channels,
     get_sponsor_gate_text,
     get_text,
+    piarflow_client,
     tgrass_client,
     verify_task,
 )
@@ -74,10 +76,21 @@ CACHE_TTL = 60  # 1 минута — задания должны обновля�
 # --- СЕССИИ DARKBOOST ---
 DARKBOOST_SESSIONS: dict[int, dict[str, Any]] = {}
 
+# --- СЕССИИ PIARFLOW (pending-ссылки, ожидающие проверки) ---
+PIARFLOW_PENDING: dict[int, set[str]] = {}
+
 
 # --------------------------------------------------------------------- helpers
 def is_admin(settings: Any, user_id: int) -> bool:
     return int(user_id) in getattr(settings, "admin_ids", frozenset())
+
+
+def _piarflow_title(link: str) -> str:
+    """Достаёт @username из ссылки вида https://t.me/username."""
+    match = re.search(r"t\.me/([A-Za-z0-9_]+)", link or "")
+    if match:
+        return f"@{match.group(1)}"
+    return "Спонсор PiarFlow"
 
 
 async def main_menu_text(db: Any, user: dict[str, Any]) -> str:
@@ -130,7 +143,9 @@ def _task_card_text(task: dict[str, Any], completed: bool) -> str:
     return "\n".join(lines)
 
 
-async def _notify_referrer(bot: Bot, referrer_id: int, payout: dict[str, Any], task_reward: int) -> None:
+async def _notify_referrer(
+    bot: Bot, referrer_id: int, payout: dict[str, Any], task_reward: int
+) -> None:
     messages: list[str] = []
     if int(payout.get("percent_amount") or 0) > 0:
         messages.append(
@@ -222,8 +237,6 @@ async def _fetch_darkboost(user_id: int, db: Any) -> tuple[list[dict], Any, str]
 
         reward_units = await db.get_int_setting("darkboost_reward_units", 20000)
 
-        # Не перезаписываем активную сессию: если она уже есть,
-        # значит пользователь ещё не нажал «Проверить» и не получил выплату.
         if sponsors and session_id and user_id not in DARKBOOST_SESSIONS:
             DARKBOOST_SESSIONS[user_id] = {
                 "session_id": session_id,
@@ -252,6 +265,48 @@ async def _fetch_darkboost(user_id: int, db: Any) -> tuple[list[dict], Any, str]
     except Exception as e:
         logger.exception("Ошибка DarkBoost: %s", e)
         raise
+
+
+async def _fetch_piarflow(
+    user_id: int, from_user: Any, db: Any
+) -> tuple[list[dict], Any, str]:
+    res = await piarflow_client.get_sponsors(
+        user_id=user_id, chat_id=user_id, max_sponsors=10
+    )
+    reward_units = await db.get_int_setting("piarflow_reward_units", 20000)
+    already_paid = await db.get_piarflow_completed_links(user_id)
+
+    pending: set[str] = PIARFLOW_PENDING.setdefault(int(user_id), set())
+    result: list[dict] = []
+
+    for s in res.get("sponsors", []):
+        link = str(s.get("link") or "")
+        status = str(s.get("status") or "")
+        if not link:
+            continue
+        if status == "not_counted":
+            continue
+        if link in already_paid:
+            continue
+        if status == "subscribed":
+            # Уже подписан, но выплаты ещё не было — дадим проверить кнопкой «Проверить»
+            pending.add(link)
+            continue
+        # status == "unsubscribed" — показываем пользователю
+        pending.add(link)
+        result.append(
+            {
+                "source": "piarflow",
+                "id": link,
+                "url": link,
+                "title": _piarflow_title(link),
+                "type": "channel",
+                "reward": reward_units,
+                "completed": False,
+                "raw": s,
+            }
+        )
+    return result, res, "PiarFlow"
 
 
 async def _fetch_flyer(user_id: int, from_user: Any, db: Any) -> tuple[list[dict], Any, str]:
@@ -303,6 +358,7 @@ async def _get_all_tasks(
                 _fetch_tgrass(user_id, from_user, db),
                 _fetch_botohub(user_id, db),
                 _fetch_darkboost(user_id, db),
+                _fetch_piarflow(user_id, from_user, db),
                 _fetch_flyer(user_id, from_user, db),
                 return_exceptions=True,
             ),
@@ -397,7 +453,7 @@ async def cmd_start(
     bot: Bot,
 ) -> None:
     await state.clear()
-    promoted = await promote_first_user(db, settings, int(user["id"]))
+    await promote_first_user(db, settings, int(user["id"]))
     payload = (command.args or "").strip()
     joined = False
 
@@ -406,7 +462,11 @@ async def cmd_start(
             referrer_id = int(payload[4:])
         except ValueError:
             referrer_id = None
-        if referrer_id is not None and referrer_id != int(user["id"]) and user.get("ref_id") is None:
+        if (
+            referrer_id is not None
+            and referrer_id != int(user["id"])
+            and user.get("ref_id") is None
+        ):
             joined = await db.set_referrer(int(user["id"]), referrer_id)
             if joined:
                 try:
@@ -439,7 +499,11 @@ async def cmd_start(
     if joined:
         join_template = await get_text(db, "referral_join")
         ref_settings = await get_ref_settings(db)
-        text = render(join_template, tasks_required=ref_settings["required_tasks"]) + "\n\n" + text
+        text = (
+            render(join_template, tasks_required=ref_settings["required_tasks"])
+            + "\n\n"
+            + text
+        )
 
     await message.answer(text, reply_markup=main_menu(is_admin(settings, int(fresh["id"]))))
 
@@ -510,7 +574,6 @@ async def cb_tasks_refresh(
     if callback.message is None:
         return
 
-    # Принудительно чистим кэш
     API_CACHE.pop(int(user["id"]), None)
 
     await safe_edit(callback.message, "⏳ <i>Ищем новые задания...</i>")
@@ -644,13 +707,13 @@ async def cb_tasks_check(
 
     await safe_edit(callback.message, "⏳ <i>Проверяем выполнение заданий...</i>")
 
-    # Сбрасываем кэш, чтобы после проверки показать актуальный список
     API_CACHE.pop(int(user["id"]), None)
 
     await asyncio.gather(
         _process_tgrass_payments(db, int(user["id"]), callback.from_user),
         _process_botohub_payments(db, int(user["id"])),
         _process_darkboost_payments(db, int(user["id"])),
+        _process_piarflow_payments(db, int(user["id"])),
     )
 
     fresh = await db.get_user(int(user["id"])) or user
@@ -718,7 +781,6 @@ async def cb_task_check(
         await callback.answer("Ты уже выполнил это задание ✅", show_alert=True)
         return
 
-    # Список заданий изменился — сбрасываем кэш, чтобы «← К заданиям» показал актуальное
     API_CACHE.pop(int(user["id"]), None)
 
     reward = int(result["reward"])
@@ -737,7 +799,7 @@ async def cb_task_check(
 
 @router.callback_query(F.data == "task:done")
 async def cb_task_done(callback: CallbackQuery) -> None:
-    """Кнопка «✅ Уже выполнено» в карточке задания — раньше была без хендлера."""
+    """Кнопка «✅ Уже выполнено» — раньше была без хендлера."""
     await callback.answer("Задание уже выполнено ✅", show_alert=True)
 
 
@@ -763,7 +825,9 @@ async def _show_balance(message: Message, db: Any, user: dict[str, Any]) -> None
 
 
 @router.callback_query(F.data == "balance:history")
-async def cb_balance_history(callback: CallbackQuery, db: Any, user: dict[str, Any]) -> None:
+async def cb_balance_history(
+    callback: CallbackQuery, db: Any, user: dict[str, Any]
+) -> None:
     if callback.message is None:
         return
     transactions = await db.get_transactions(int(user["id"]), limit=15)
@@ -819,7 +883,9 @@ async def _show_profile(
         notifications="включены" if notifications else "выключены",
     )
     partner_url = await db.get_setting("partner_channel_url")
-    await safe_edit(message, text, profile_menu(language, notifications, partner_url or None))
+    await safe_edit(
+        message, text, profile_menu(language, notifications, partner_url or None)
+    )
 
 
 @router.callback_query(F.data.startswith("profile:lang:"))
@@ -902,7 +968,9 @@ async def promo_code(
     else:
         text = "❌ Неверный промокод или он уже закончился."
     fresh = await db.get_user(int(user["id"])) or user
-    await message.answer(text, reply_markup=main_menu(is_admin(settings, int(fresh["id"]))))
+    await message.answer(
+        text, reply_markup=main_menu(is_admin(settings, int(fresh["id"])))
+    )
 
 
 # ------------------------------------------------------------------- Начисления
@@ -999,8 +1067,43 @@ async def _process_darkboost_payments(db: Any, user_id: int) -> None:
 
             DARKBOOST_SESSIONS.pop(user_id, None)
         else:
-            logger.info(
-                "DarkBoost: статус не ok user=%s res=%s", user_id, res,
-            )
+            logger.info("DarkBoost: статус не ok user=%s res=%s", user_id, res)
     except Exception as e:
         logger.exception("DarkBoost: ошибка при проверке сессии user=%s: %s", user_id, e)
+
+
+async def _process_piarflow_payments(db: Any, user_id: int) -> None:
+    try:
+        links = list(PIARFLOW_PENDING.get(int(user_id), set()))
+        if not links:
+            logger.debug("PiarFlow: нет pending-ссылок user=%s", user_id)
+            return
+
+        res = await piarflow_client.check(user_id, links)
+        reward_units = await db.get_int_setting("piarflow_reward_units", 20000)
+        ref = await get_ref_settings(db)
+
+        pending = PIARFLOW_PENDING.setdefault(int(user_id), set())
+        for item in res.get("sponsors", []):
+            link = str(item.get("link") or "")
+            status = str(item.get("status") or "")
+            if not link:
+                continue
+            if status == "subscribed":
+                success = await db.complete_piarflow_offer(user_id, link, reward_units)
+                if success:
+                    logger.info("PiarFlow: начислено user=%s link=%s", user_id, link)
+                    await db.apply_referral_rewards(
+                        user_id,
+                        reward_units,
+                        required_tasks=ref["required_tasks"],
+                        bonus=ref["bonus_units"],
+                        percent=ref["percent"],
+                    )
+                pending.discard(link)
+            elif status == "not_counted":
+                logger.info("PiarFlow: not_counted user=%s link=%s", user_id, link)
+                pending.discard(link)
+            # status == "unsubscribed" — оставляем в pending, попробует позже
+    except Exception:
+        logger.exception("PiarFlow: ошибка при проверке платежей user=%s", user_id)
